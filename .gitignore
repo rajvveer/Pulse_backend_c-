@@ -1,0 +1,32 @@
+# Build output
+/build/
+/out/
+/cmake-build-*/
+*.o
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# vcpkg
+/vcpkg_installed/
+/vcpkg/
+
+# Env & secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Logs
+/logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.user
+compile_commands.json
+
+# Runtime upload storage
+/uploads/
