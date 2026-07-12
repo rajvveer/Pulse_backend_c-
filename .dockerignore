@@ -1,0 +1,35 @@
+# Keep the Docker build context tiny + never ship secrets or Windows build junk.
+
+# Windows / local build artifacts (the image rebuilds from source on Linux).
+build/
+out/
+vcpkg_installed/
+*.dll
+*.exe
+*.pdb
+*.lib
+*.ilk
+*.exp
+
+# vcpkg local clones / overlays caches (the image clones vcpkg fresh).
+vcpkg/
+.vcpkg/
+
+# Secrets — env files NEVER go into the image. Pass env at runtime instead.
+.env
+.env.*
+!.env.production.example
+
+# VCS / editor / OS noise.
+.git/
+.gitignore
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+
+# Docs / scripts not needed to build the binary.
+*.md
+scripts/
+tests/
