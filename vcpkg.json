@@ -1,0 +1,22 @@
+{
+  "name": "pulse-backend-cpp",
+  "version": "1.0.0",
+  "description": "Pulse - Hyperlocal Social Network Backend (C++ port of the Node.js backend)",
+  "homepage": "https://github.com/pulse/pulse-backend-cpp",
+  "builtin-baseline": "052c8fcb758e4d1ec280ef0ad83bef611d591553",
+  "dependencies": [
+    {
+      "name": "drogon",
+      "features": ["redis"]
+    },
+    "jsoncpp",
+    "mongo-cxx-driver",
+    "redis-plus-plus",
+    "jwt-cpp",
+    "openssl",
+    "zlib",
+    "spdlog",
+    "fmt"
+  ],
+  "overrides": []
+}
