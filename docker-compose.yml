@@ -1,0 +1,83 @@
+# docker-compose.yml — production stack for the Pulse C++ backend.
+#
+#   backend  — the compiled C++ server (built from ./Dockerfile)
+#   redis    — required by the backend (presence, rate limits, cache, pub/sub)
+#   caddy    — OPTIONAL reverse proxy with automatic HTTPS (profile: "tls").
+#              Enable with:  docker compose --profile tls up -d
+#              Skip it if you terminate TLS elsewhere (nginx, a cloud LB, etc.).
+#
+# MongoDB stays on Atlas (cloud) — it is NOT a service here; the backend reaches
+# it via MONGO_URI in .env.production.
+#
+# Usage:
+#   1. cp .env.production.example .env.production   # then fill in the secrets
+#   2. docker compose up -d --build                 # http on :3000
+#   3. (optional TLS) edit Caddyfile domain, then:
+#      docker compose --profile tls up -d --build   # https via Caddy on :443
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pulse-backend:latest
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      # Point the backend at the redis service (overrides any .env value).
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+      PORT: "3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Only expose the port directly when NOT using the caddy TLS proxy. With the
+    # tls profile, leave the backend internal and let caddy reach it over the
+    # compose network. For plain HTTP testing this publishes 3000.
+    ports:
+      - "3000:3000"
+    networks:
+      - pulse
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Persist to disk so presence/cache survive a restart. AOF for durability.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - pulse
+
+  # Optional: automatic-HTTPS reverse proxy. Enable with `--profile tls`.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    profiles: ["tls"]
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - pulse
+
+networks:
+  pulse:
+    driver: bridge
+
+volumes:
+  redis-data:
+  caddy-data:
+  caddy-config:
