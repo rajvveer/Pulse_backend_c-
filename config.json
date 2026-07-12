@@ -1,0 +1,35 @@
+{
+  "_comment": "Drogon runtime config. The app overrides listener/port/threads from env at startup (see src/main.cc), but these defaults mirror the Node server.js settings.",
+  "listeners": [
+    {
+      "address": "0.0.0.0",
+      "port": 3000,
+      "https": false
+    }
+  ],
+  "app": {
+    "threads_num": 0,
+    "enable_session": false,
+    "document_root": "./public",
+    "max_connections": 100000,
+    "max_connections_per_ip": 0,
+    "load_dynamic_views": false,
+    "log": {
+      "log_level": "INFO",
+      "use_spdlog": true
+    },
+    "run_as_daemon": false,
+    "relaunch_on_error": false,
+    "use_sendfile": true,
+    "use_gzip": true,
+    "use_brotli": false,
+    "static_files_cache_time": 5,
+    "idle_connection_timeout": 65,
+    "server_header_field": "pulse",
+    "keepalive_requests": 0,
+    "pipelining_requests": 0,
+    "client_max_body_size": "1M",
+    "client_max_memory_body_size": "256K",
+    "client_max_websocket_message_size": "1M"
+  }
+}
