@@ -1,0 +1,21 @@
+# Caddyfile — automatic HTTPS reverse proxy for the Pulse backend.
+#
+# Replace api.yourdomain.com with your real domain (its DNS A record must point
+# at this server's public IP). Caddy provisions + renews a Let's Encrypt cert
+# automatically — no certbot, no manual renewal.
+#
+# reverse_proxy transparently upgrades WebSocket connections, so the realtime
+# /ws endpoint (chat + call signaling) works through it with no extra config.
+#
+# After editing the domain:  docker compose --profile tls up -d
+
+api.yourdomain.com {
+	encode gzip
+	reverse_proxy backend:3000
+}
+
+# To run plain HTTP on a bare IP instead (no domain / no TLS), comment the block
+# above and uncomment this one — then reach the server at http://SERVER_IP:
+# :80 {
+# 	reverse_proxy backend:3000
+# }
