@@ -70,6 +70,13 @@ without them):
 - `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` / `LIVEKIT_WS_URL` — for calling.
 - `SERVER_URL` — your public URL (e.g. `https://api.yourdomain.com`).
 
+Authentication providers are fail-closed feature flags:
+- Set `ENABLE_FIREBASE_AUTH=true` only after configuring the Firebase service
+  account fields (or mounting its JSON file and setting
+  `FIREBASE_SERVICE_ACCOUNT_PATH`).
+- Set `ENABLE_GOOGLE_LOGIN=true` only after setting `GOOGLE_CLIENT_ID` or the
+  comma-separated `GOOGLE_OAUTH_CLIENT_IDS` allowlist.
+
 `REDIS_*` are set automatically by compose to the `redis` service — leave them
 commented in `.env.production`.
 
@@ -96,8 +103,8 @@ You want to see, with **no** "Missing required environment variables" warning:
 
 Test it:
 ```bash
-curl http://SERVER_IP:3000/health          # {"status":"OK",...}
-curl http://SERVER_IP:3000/health/ready     # checks Mongo + Redis
+curl http://127.0.0.1:3000/health          # {"status":"OK",...}
+curl http://127.0.0.1:3000/health/ready    # checks Mongo + Redis
 ```
 
 If `/health/ready` is OK, the server is fully live (DB + Redis reachable).
@@ -111,8 +118,8 @@ WebRTC expect it). Caddy does this with zero cert hassle.
 
 1. Edit `Caddyfile` — replace `api.yourdomain.com` with your real domain (DNS A
    record must already point at the server).
-2. (Recommended) stop publishing the backend port directly so only Caddy is
-   exposed — in `docker-compose.yml`, remove/comment the backend `ports:` block.
+2. The compose file binds backend port 3000 to host loopback only. Do not change
+   that binding to `0.0.0.0`; public traffic must enter through Caddy HTTPS.
 3. Bring it up with the TLS profile:
 
 ```bash

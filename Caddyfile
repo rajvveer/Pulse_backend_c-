@@ -11,7 +11,17 @@
 
 api.yourdomain.com {
 	encode gzip
-	reverse_proxy backend:3000
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'; frame-ancestors 'none'"
+		-Server
+	}
+	reverse_proxy backend:3000 {
+		# Replace, rather than append to, an untrusted client-supplied chain.
+		header_up X-Forwarded-For {remote_host}
+	}
 }
 
 # To run plain HTTP on a bare IP instead (no domain / no TLS), comment the block

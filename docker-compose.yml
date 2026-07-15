@@ -11,7 +11,7 @@
 #
 # Usage:
 #   1. cp .env.production.example .env.production   # then fill in the secrets
-#   2. docker compose up -d --build                 # http on :3000
+#   2. docker compose up -d --build                 # host-local http on :3000
 #   3. (optional TLS) edit Caddyfile domain, then:
 #      docker compose --profile tls up -d --build   # https via Caddy on :443
 services:
@@ -30,14 +30,18 @@ services:
       REDIS_URL: redis://redis:6379
       NODE_ENV: production
       PORT: "3000"
+      # Caddy is the sole network-facing proxy; use the right-most forwarded
+      # address and ignore arbitrary longer X-Forwarded-For chains.
+      TRUST_PROXY_HOPS: "1"
+      REDIS_CONNECT_TIMEOUT_MS: "${REDIS_CONNECT_TIMEOUT_MS:-5000}"
+      REDIS_SOCKET_TIMEOUT_MS: "${REDIS_SOCKET_TIMEOUT_MS:-5000}"
     depends_on:
       redis:
         condition: service_healthy
-    # Only expose the port directly when NOT using the caddy TLS proxy. With the
-    # tls profile, leave the backend internal and let caddy reach it over the
-    # compose network. For plain HTTP testing this publishes 3000.
+    # Host-local diagnostics remain available, but the plaintext backend is not
+    # reachable from the public network. Caddy reaches port 3000 internally.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:${BACKEND_PORT:-3000}:3000"
     networks:
       - pulse
 
