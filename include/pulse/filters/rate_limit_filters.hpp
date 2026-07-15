@@ -20,6 +20,11 @@ namespace pulse::filters {
 
 using namespace drogon;
 
+// Effective client address for abuse controls. Forwarded addresses are honored
+// only when TRUST_PROXY_HOPS is set and the direct peer is a private/loopback
+// reverse proxy (the compose/Caddy topology).
+std::string clientIp(const HttpRequestPtr& req);
+
 // Shared core: returns true (and fills resp) if the request is over the limit.
 bool rateLimited(const HttpRequestPtr& req, const std::string& prefix, int max,
                  bool keyByUser, const std::string& errMsg, const std::string& errCode,
