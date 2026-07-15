@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <string>
 #include <unordered_set>
@@ -52,6 +53,36 @@ namespace {
 // Read a possibly-missing string field ("" when absent/null/non-string).
 std::string str(const Json::Value& v, const char* key) {
   return v.isObject() && v.isMember(key) && v[key].isString() ? v[key].asString() : "";
+}
+
+constexpr std::size_t kMaxGroupMembers = 100;
+constexpr std::size_t kMaxGroupNameBytes = 100;
+constexpr std::size_t kMaxGroupDescriptionBytes = 1000;
+constexpr std::size_t kMaxGroupAvatarBytes = 2048;
+
+std::string trim(std::string value) {
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string::npos) return {};
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+// Every member reference must resolve to a currently active account. Silently
+// dropping malformed/deleted IDs can create undersized groups and dangling
+// authorization entries.
+bool allActiveUsers(const std::vector<std::string>& ids) {
+  if (ids.empty()) return true;
+  bld::array oidArray;
+  for (const auto& id : ids) {
+    auto oid = pulse::bsonjson::tryOid(id);
+    if (!oid) return false;
+    oidArray.append(*oid);
+  }
+  auto users = pulse::db::collection(pulse::models::user::kCollection);
+  const auto count = users.count_documents(make_document(
+      kvp("_id", make_document(kvp("$in", oidArray.extract()))),
+      kvp("isActive", true)));
+  return count == static_cast<std::int64_t>(ids.size());
 }
 
 // The authenticated user stored on the request by AuthFilter:
@@ -243,17 +274,28 @@ void GroupController::createGroup(
     auto bodyPtr = req->getJsonObject();
     Json::Value body = bodyPtr ? *bodyPtr : Json::Value(Json::objectValue);
 
-    const std::string groupName = str(body, "groupName");
+    const std::string groupName = trim(str(body, "groupName"));
     const Json::Value& participants = body["participants"];
     Json::Value user = authUser(req);
     const std::string creatorId = str(user, "userId");
 
-    // Validation: !groupName || !participants || participants.length < 2
-    bool hasParticipants = participants.isArray();
-    int pcount = hasParticipants ? static_cast<int>(participants.size()) : 0;
-    if (groupName.empty() || !hasParticipants || pcount < 2) {
+    if (groupName.empty() || groupName.size() > kMaxGroupNameBytes ||
+        !participants.isArray() || participants.size() < 2 ||
+        participants.size() > kMaxGroupMembers - 1 ||
+        !pulse::bsonjson::isValidOid(creatorId)) {
       return callback(fail(drogon::k400BadRequest,
-                           "Group name and at least 2 participants required"));
+                           "Invalid group name or participants"));
+    }
+    if ((body.isMember("groupDescription") &&
+         !body["groupDescription"].isNull() &&
+         (!body["groupDescription"].isString() ||
+          body["groupDescription"].asString().size() >
+              kMaxGroupDescriptionBytes)) ||
+        (body.isMember("groupAvatar") && !body["groupAvatar"].isNull() &&
+         (!body["groupAvatar"].isString() ||
+          body["groupAvatar"].asString().size() > kMaxGroupAvatarBytes))) {
+      return callback(fail(drogon::k400BadRequest,
+                           "Invalid group description or avatar"));
     }
 
     // allParticipants = [...new Set([creatorId, ...participants])]
@@ -264,7 +306,22 @@ void GroupController::createGroup(
     };
     addUnique(creatorId);
     for (const auto& p : participants) {
-      if (p.isString()) addUnique(p.asString());
+      if (!p.isString() || !pulse::bsonjson::isValidOid(p.asString())) {
+        return callback(fail(drogon::k400BadRequest,
+                             "Participant IDs must be valid user IDs"));
+      }
+      addUnique(p.asString());
+    }
+    if (allParticipants.size() < 3 ||
+        allParticipants.size() > kMaxGroupMembers) {
+      return callback(fail(drogon::k400BadRequest,
+                           "At least 2 distinct participants are required"));
+    }
+    std::vector<std::string> invited(allParticipants.begin() + 1,
+                                     allParticipants.end());
+    if (!allActiveUsers(invited)) {
+      return callback(fail(drogon::k400BadRequest,
+                           "One or more participants are unavailable"));
     }
 
     // unreadCounts: { [id]: 0 } for every participant.
@@ -362,12 +419,20 @@ void GroupController::getGroupDetails(
       return callback(fail(drogon::k404NotFound, "Group not found"));
     }
 
-    // Populate (participants include isOnline here; admins + createdBy as above).
-    Json::Value group = findByIdPopulated(
-        groupId,
-        {"username", "name", "avatar", "profile.avatar", "isVerified", "isOnline"},
-        {"username", "name", "avatar", "profile.avatar"},
-        {"username", "name", "avatar", "profile.avatar"});
+    // Populate the same authorized snapshot. Re-fetching by ID alone after the
+    // membership check could disclose the group if removal raced this request.
+    Json::Value group = pulse::models::conversation::sanitizeForOutput(
+        pulse::bsonjson::toJson(doc->view()));
+    populateUserArray(
+        group, "participants",
+        userProjection({"username", "name", "avatar", "profile.avatar",
+                        "isVerified", "isOnline"}));
+    populateUserArray(
+        group, "admins",
+        userProjection({"username", "name", "avatar", "profile.avatar"}));
+    populateUserField(
+        group, "createdBy",
+        userProjection({"username", "name", "avatar", "profile.avatar"}));
 
     return callback(okData(std::move(group)));
   } catch (const std::exception& e) {
@@ -389,7 +454,8 @@ void GroupController::addGroupMembers(
     const Json::Value& userIds = body["userIds"];
 
     // !userIds || !Array.isArray(userIds) || userIds.length === 0
-    if (!userIds.isArray() || userIds.empty()) {
+    if (!userIds.isArray() || userIds.empty() ||
+        userIds.size() > kMaxGroupMembers) {
       return callback(fail(drogon::k400BadRequest, "User IDs required"));
     }
 
@@ -399,6 +465,8 @@ void GroupController::addGroupMembers(
 
     auto gOid = pulse::bsonjson::tryOid(groupId);
     auto rOid = pulse::bsonjson::tryOid(requesterId);
+    if (!gOid || !rOid)
+      return callback(fail(drogon::k400BadRequest, "Invalid group ID"));
     auto col = pulse::db::collection(pulse::models::conversation::kCollection);
 
     // Admin check: findOne({ _id, type:'group', admins: req.user.userId })
@@ -425,14 +493,26 @@ void GroupController::addGroupMembers(
 
     // newMembers = userIds.filter(id => !group.participants.includes(id))
     std::vector<std::string> newMembers;
+    std::unordered_set<std::string> requested;
     for (const auto& id : userIds) {
-      if (id.isString() && existing.find(id.asString()) == existing.end()) {
+      if (!id.isString() || !pulse::bsonjson::isValidOid(id.asString()))
+        return callback(fail(drogon::k400BadRequest,
+                             "User IDs must be valid"));
+      if (existing.find(id.asString()) == existing.end() &&
+          requested.insert(id.asString()).second)
         newMembers.push_back(id.asString());
-      }
     }
 
     if (newMembers.empty()) {
       return callback(fail(drogon::k400BadRequest, "All users are already members"));
+    }
+    if (existing.size() + newMembers.size() > kMaxGroupMembers) {
+      return callback(fail(drogon::k400BadRequest,
+                           "Group member limit exceeded"));
+    }
+    if (!allActiveUsers(newMembers)) {
+      return callback(fail(drogon::k400BadRequest,
+                           "One or more users are unavailable"));
     }
 
     // $addToSet: { participants: { $each: newMembers } }
@@ -440,17 +520,22 @@ void GroupController::addGroupMembers(
     for (const auto& id : newMembers) {
       if (auto o = pulse::bsonjson::tryOid(id)) eachOids.append(*o);
     }
-    col.update_one(
-        make_document(kvp("_id", *gOid)),
-        make_document(kvp("$addToSet",
-            make_document(kvp("participants",
-                make_document(kvp("$each", eachOids.extract())))))));
-
-    // $set: { `unreadCounts.${id}`: 0 } for each new member.
+    // Add members and initialize unread counts in one authorized update so an
+    // admin removal cannot split the two writes.
     bld::document unreadSet;
     for (const auto& id : newMembers) unreadSet.append(kvp("unreadCounts." + id, 0));
-    col.update_one(make_document(kvp("_id", *gOid)),
-                   make_document(kvp("$set", unreadSet.extract())));
+    auto updated = col.update_one(
+        make_document(kvp("_id", *gOid),
+                      kvp("type", pulse::models::conversation::kTypeGroup),
+                      kvp("admins", *rOid)),
+        make_document(
+            kvp("$addToSet", make_document(kvp(
+                "participants",
+                make_document(kvp("$each", eachOids.extract()))))),
+            kvp("$set", unreadSet.extract())));
+    if (!updated || updated->matched_count() != 1)
+      return callback(fail(drogon::k409Conflict,
+                           "Group membership changed; try again"));
 
     // System message: `${req.user.username} added ${usernames}`
     std::vector<std::string> usernames = usernamesFor(newMembers);
@@ -485,6 +570,9 @@ void GroupController::removeGroupMember(
 
     auto gOid = pulse::bsonjson::tryOid(groupId);
     auto rOid = pulse::bsonjson::tryOid(requesterId);
+    auto pullOid = pulse::bsonjson::tryOid(userId);
+    if (!gOid || !rOid || !pullOid)
+      return callback(fail(drogon::k400BadRequest, "Invalid user or group ID"));
     auto col = pulse::db::collection(pulse::models::conversation::kCollection);
 
     bsoncxx::stdx::optional<bsoncxx::document::value> groupDoc;
@@ -505,14 +593,22 @@ void GroupController::removeGroupMember(
       return callback(fail(drogon::k400BadRequest, "Cannot remove group creator"));
     }
 
-    // $pull: { participants: userId, admins: userId }
-    auto pullOid = pulse::bsonjson::tryOid(userId);
-    if (pullOid) {
-      col.update_one(
-          make_document(kvp("_id", *gOid)),
-          make_document(kvp("$pull",
-              make_document(kvp("participants", *pullOid), kvp("admins", *pullOid)))));
-    }
+    // Keep authorization and membership in the mutation predicate so a stale
+    // pre-check cannot remove a user after the requester loses admin access.
+    auto removed = col.update_one(
+        make_document(
+            kvp("_id", *gOid), kvp("admins", *rOid),
+            kvp("participants", *pullOid),
+            kvp("createdBy", make_document(kvp("$ne", *pullOid)))),
+        make_document(
+            kvp("$pull", make_document(kvp("participants", *pullOid),
+                                         kvp("admins", *pullOid))),
+            kvp("$unset", make_document(
+                kvp("unreadCounts." + userId, ""))),
+            kvp("$set", make_document(kvp("updatedAt", nowDate())))));
+    if (!removed || removed->modified_count() != 1)
+      return callback(fail(drogon::k409Conflict,
+                           "Member or group authorization changed"));
 
     // System message: `${req.user.username} removed ${removedUser.username}`
     std::vector<std::string> names = usernamesFor({userId});
@@ -540,6 +636,8 @@ void GroupController::leaveGroup(
 
     auto gOid = pulse::bsonjson::tryOid(groupId);
     auto uOid = pulse::bsonjson::tryOid(userId);
+    if (!gOid || !uOid)
+      return callback(fail(drogon::k400BadRequest, "Invalid group ID"));
     auto col = pulse::db::collection(pulse::models::conversation::kCollection);
 
     bsoncxx::stdx::optional<bsoncxx::document::value> groupDoc;
@@ -561,13 +659,19 @@ void GroupController::leaveGroup(
                            "Group creator cannot leave. Delete the group instead."));
     }
 
-    // $pull: { participants: userId, admins: userId }
-    if (uOid) {
-      col.update_one(
-          make_document(kvp("_id", *gOid)),
-          make_document(kvp("$pull",
-              make_document(kvp("participants", *uOid), kvp("admins", *uOid)))));
-    }
+    auto left = col.update_one(
+        make_document(
+            kvp("_id", *gOid), kvp("participants", *uOid),
+            kvp("createdBy", make_document(kvp("$ne", *uOid)))),
+        make_document(
+            kvp("$pull", make_document(kvp("participants", *uOid),
+                                         kvp("admins", *uOid))),
+            kvp("$unset", make_document(
+                kvp("unreadCounts." + userId, ""))),
+            kvp("$set", make_document(kvp("updatedAt", nowDate())))));
+    if (!left || left->modified_count() != 1)
+      return callback(fail(drogon::k409Conflict,
+                           "Group membership changed; try again"));
 
     // System message: `${req.user.username} left the group`
     createSystemMessage(groupId, userId, username + " left the group");
@@ -616,10 +720,24 @@ void GroupController::updateGroupInfo(
     //   if (groupName) updates.groupName = groupName  (truthy)
     //   if (groupDescription !== undefined) updates.groupDescription = ...
     //   if (groupAvatar !== undefined) updates.groupAvatar = ...
-    const std::string groupName = str(body, "groupName");
+    const std::string groupName = trim(str(body, "groupName"));
     const bool nameProvided = !groupName.empty();
     const bool descProvided = body.isMember("groupDescription");
     const bool avatarProvided = body.isMember("groupAvatar");
+
+    if ((body.isMember("groupName") &&
+         (!body["groupName"].isString() || groupName.empty() ||
+          groupName.size() > kMaxGroupNameBytes)) ||
+        (descProvided && !body["groupDescription"].isNull() &&
+         (!body["groupDescription"].isString() ||
+          body["groupDescription"].asString().size() >
+              kMaxGroupDescriptionBytes)) ||
+        (avatarProvided && !body["groupAvatar"].isNull() &&
+         (!body["groupAvatar"].isString() ||
+          body["groupAvatar"].asString().size() > kMaxGroupAvatarBytes))) {
+      return callback(fail(drogon::k400BadRequest,
+                           "Invalid group update"));
+    }
 
     bld::document updates;
     bool hasUpdate = false;
@@ -638,8 +756,15 @@ void GroupController::updateGroupInfo(
     }
 
     if (hasUpdate) {
-      col.update_one(make_document(kvp("_id", *gOid)),
-                     make_document(kvp("$set", updates.extract())));
+      updates.append(kvp("updatedAt", nowDate()));
+      auto result = col.update_one(
+          make_document(kvp("_id", *gOid),
+                        kvp("type", pulse::models::conversation::kTypeGroup),
+                        kvp("admins", *rOid)),
+          make_document(kvp("$set", updates.extract())));
+      if (!result || result->matched_count() != 1)
+        return callback(fail(drogon::k409Conflict,
+                             "Group authorization changed; try again"));
     }
 
     // System message for name change:
@@ -680,6 +805,9 @@ void GroupController::makeAdmin(
 
     auto gOid = pulse::bsonjson::tryOid(groupId);
     auto rOid = pulse::bsonjson::tryOid(requesterId);
+    auto targetOid = pulse::bsonjson::tryOid(userId);
+    if (!gOid || !rOid || !targetOid)
+      return callback(fail(drogon::k400BadRequest, "Invalid user or group ID"));
     auto col = pulse::db::collection(pulse::models::conversation::kCollection);
 
     // Only creator can make admins: findOne({ _id, type:'group', createdBy: req.user.userId })
@@ -708,10 +836,16 @@ void GroupController::makeAdmin(
     }
 
     // $addToSet: { admins: userId }
-    if (auto o = pulse::bsonjson::tryOid(userId)) {
-      col.update_one(make_document(kvp("_id", *gOid)),
-                     make_document(kvp("$addToSet", make_document(kvp("admins", *o)))));
-    }
+    auto promoted = col.update_one(
+        make_document(kvp("_id", *gOid), kvp("createdBy", *rOid),
+                      kvp("participants", *targetOid),
+                      kvp("admins", make_document(kvp("$ne", *targetOid)))),
+        make_document(
+            kvp("$addToSet", make_document(kvp("admins", *targetOid))),
+            kvp("$set", make_document(kvp("updatedAt", nowDate())))));
+    if (!promoted || promoted->modified_count() != 1)
+      return callback(fail(drogon::k409Conflict,
+                           "User is already an admin or membership changed"));
 
     // System message: `${user.username} is now an admin`
     std::vector<std::string> names = usernamesFor({userId});
@@ -738,6 +872,9 @@ void GroupController::removeAdmin(
 
     auto gOid = pulse::bsonjson::tryOid(groupId);
     auto rOid = pulse::bsonjson::tryOid(requesterId);
+    auto targetOid = pulse::bsonjson::tryOid(userId);
+    if (!gOid || !rOid || !targetOid)
+      return callback(fail(drogon::k400BadRequest, "Invalid user or group ID"));
     auto col = pulse::db::collection(pulse::models::conversation::kCollection);
 
     bsoncxx::stdx::optional<bsoncxx::document::value> groupDoc;
@@ -758,11 +895,16 @@ void GroupController::removeAdmin(
       return callback(fail(drogon::k400BadRequest, "Cannot remove creator as admin"));
     }
 
-    // $pull: { admins: userId }
-    if (auto o = pulse::bsonjson::tryOid(userId)) {
-      col.update_one(make_document(kvp("_id", *gOid)),
-                     make_document(kvp("$pull", make_document(kvp("admins", *o)))));
-    }
+    auto demoted = col.update_one(
+        make_document(
+            kvp("_id", *gOid), kvp("createdBy", *rOid),
+            kvp("admins", *targetOid)),
+        make_document(
+            kvp("$pull", make_document(kvp("admins", *targetOid))),
+            kvp("$set", make_document(kvp("updatedAt", nowDate())))));
+    if (!demoted || demoted->modified_count() != 1)
+      return callback(fail(drogon::k409Conflict,
+                           "Admin state changed; try again"));
 
     // System message: `${user.username} is no longer an admin`
     std::vector<std::string> names = usernamesFor({userId});
