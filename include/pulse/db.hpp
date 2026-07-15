@@ -7,6 +7,7 @@
 #pragma once
 #include <string>
 #include <memory>
+#include <utility>
 #include <mongocxx/pool.hpp>
 #include <mongocxx/client.hpp>
 #include <mongocxx/collection.hpp>
@@ -38,10 +39,73 @@ private:
   mongocxx::pool::entry entry_;
 };
 
-// Shorthand: db::collection("users") opens a client + returns the collection.
-// NOTE: the returned collection borrows from a temporary client; for multi-step
-// transactions hold a ClientHandle instead.
-mongocxx::collection collection(const std::string& name);
+namespace detail {
+
+// This owner is the first base of CollectionHandle and is therefore destroyed
+// after its mongocxx::collection base. That ordering keeps the pool client alive
+// while the driver collection tears down.
+class CollectionLeaseHolder {
+protected:
+  explicit CollectionLeaseHolder(std::shared_ptr<void> lease) noexcept
+      : lease_(std::move(lease)) {}
+  CollectionLeaseHolder(const CollectionLeaseHolder&) = default;
+  CollectionLeaseHolder(CollectionLeaseHolder&&) noexcept = default;
+  CollectionLeaseHolder& operator=(const CollectionLeaseHolder&) = default;
+  CollectionLeaseHolder& operator=(CollectionLeaseHolder&&) noexcept = default;
+  ~CollectionLeaseHolder() = default;
+
+private:
+  std::shared_ptr<void> lease_;
+};
+
+} // namespace detail
+
+// A collection plus ownership of the pool entry from which it came. Public
+// inheritance preserves the existing `auto col = db::collection(...); col.find`
+// API and permits passing a handle to helpers taking mongocxx::collection&.
+class CollectionHandle final : private detail::CollectionLeaseHolder,
+                               public mongocxx::collection {
+public:
+  CollectionHandle(const CollectionHandle&) = default;
+  CollectionHandle(CollectionHandle&&) noexcept = default;
+
+  CollectionHandle& operator=(const CollectionHandle& other) {
+    if (this != &other) {
+      // Dispose/copy the driver collection while the old lease is still held.
+      mongocxx::collection::operator=(
+          static_cast<const mongocxx::collection&>(other));
+      detail::CollectionLeaseHolder::operator=(
+          static_cast<const detail::CollectionLeaseHolder&>(other));
+    }
+    return *this;
+  }
+
+  CollectionHandle& operator=(CollectionHandle&& other) noexcept {
+    if (this != &other) {
+      // Dispose/move the driver collection while the old lease is still held.
+      mongocxx::collection::operator=(
+          static_cast<mongocxx::collection&&>(other));
+      detail::CollectionLeaseHolder::operator=(
+          static_cast<detail::CollectionLeaseHolder&&>(other));
+    }
+    return *this;
+  }
+
+  ~CollectionHandle() = default;
+
+private:
+  friend CollectionHandle collection(const std::string& name);
+
+  CollectionHandle(std::shared_ptr<void> lease, mongocxx::collection col)
+      : detail::CollectionLeaseHolder(std::move(lease)),
+        mongocxx::collection(std::move(col)) {}
+};
+
+// Checks a client out for the lifetime of the returned handle. Concurrent
+// handles created on one thread share a lease, so code touching several
+// collections does not consume one pool client per collection. The lease is
+// returned as soon as that thread's last handle is destroyed.
+CollectionHandle collection(const std::string& name);
 
 // Create an index, tolerating the benign "an equivalent index already exists"
 // errors (IndexOptionsConflict/IndexKeySpecsConflict/IndexAlreadyExists and the

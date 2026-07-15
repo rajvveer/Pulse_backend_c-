@@ -14,7 +14,9 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 #include <thread>
+#include <stdexcept>
 
 namespace pulse::db {
 
@@ -24,6 +26,27 @@ std::unique_ptr<mongocxx::pool> g_pool;
 std::string g_dbName;
 std::atomic<bool> g_connected{false};
 std::once_flag g_initFlag;
+
+struct ClientLease {
+  explicit ClientLease(mongocxx::pool::entry poolEntry)
+      : entry(std::move(poolEntry)) {}
+
+  mongocxx::pool::entry entry;
+};
+
+// The weak pointer deliberately does not pin a pool client to a worker. It only
+// allows simultaneously-live collection handles on a thread to share a single
+// checkout, which is important for handlers that query several collections.
+thread_local std::weak_ptr<ClientLease> g_threadLease;
+
+std::shared_ptr<ClientLease> acquireThreadLease() {
+  if (auto existing = g_threadLease.lock()) return existing;
+  if (!g_pool) throw std::logic_error("MongoDB pool is not initialized");
+
+  auto lease = std::make_shared<ClientLease>(g_pool->acquire());
+  g_threadLease = lease;
+  return lease;
+}
 
 // Extract the default database name from the URI path (…/pulse?…).
 std::string dbNameFromUri(const std::string& uri) {
@@ -45,11 +68,17 @@ void connect() {
     // Pool sizing mirrors database.js: a per-container budget divided by worker
     // count, clamped to >= 5; explicit MONGO_OPTIONS_MAX_POOL_SIZE wins.
     unsigned workers = std::max(1u, std::thread::hardware_concurrency());
-    long long explicitPool = cfg.envInt("MONGO_OPTIONS_MAX_POOL_SIZE", 0);
-    long long budget = cfg.envInt("MONGO_CONTAINER_POOL_BUDGET", 50);
+    long long explicitPool = std::clamp<long long>(
+        cfg.envInt("MONGO_OPTIONS_MAX_POOL_SIZE", 0), 0, 500);
+    long long budget = std::clamp<long long>(
+        cfg.envInt("MONGO_CONTAINER_POOL_BUDGET", 50), 5, 500);
     long long derived = std::max<long long>(5, budget / workers);
-    long long maxPool = explicitPool ? explicitPool : derived;
-    long long minPool = cfg.envInt("MONGO_OPTIONS_MIN_POOL_SIZE", std::min<long long>(2, maxPool));
+    long long maxPool = std::clamp<long long>(
+        explicitPool ? explicitPool : derived, 1, 500);
+    long long minPool = std::clamp<long long>(
+        cfg.envInt("MONGO_OPTIONS_MIN_POOL_SIZE",
+                   std::min<long long>(2, maxPool)),
+        0, maxPool);
 
     try {
       g_instance = std::make_unique<mongocxx::instance>();
@@ -111,11 +140,11 @@ mongocxx::client& ClientHandle::client() { return *entry_; }
 mongocxx::database ClientHandle::database() { return (*entry_)[g_dbName]; }
 mongocxx::collection ClientHandle::collection(const std::string& name) { return (*entry_)[g_dbName][name]; }
 
-mongocxx::collection collection(const std::string& name) {
-  // Borrow a client for the lifetime of this call's collection use. Callers
-  // that need multi-step ops should hold a ClientHandle.
-  thread_local mongocxx::pool::entry tlEntry = g_pool->acquire();
-  return (*tlEntry)[g_dbName][name];
+CollectionHandle collection(const std::string& name) {
+  auto lease = acquireThreadLease();
+  auto col = (*lease->entry)[g_dbName][name];
+  return CollectionHandle{std::static_pointer_cast<void>(std::move(lease)),
+                          std::move(col)};
 }
 
 void safeCreateIndex(mongocxx::collection& col,
