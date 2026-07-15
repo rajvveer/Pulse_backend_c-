@@ -19,18 +19,21 @@
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/types.hpp>
 #include <bsoncxx/oid.hpp>
+#include <openssl/rand.h>
 
 #include <mongocxx/collection.hpp>
 #include <mongocxx/cursor.hpp>
 #include <mongocxx/options/find.hpp>
 #include <mongocxx/options/index.hpp>
 #include <mongocxx/options/find_one_and_update.hpp>
+#include <mongocxx/exception/operation_exception.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
-#include <random>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -68,12 +71,23 @@ void appendUserId(bld::document& doc, const std::string& key, const std::string&
   else                              doc.append(kvp(key, userId));
 }
 
-// Pick a random icebreaker: ICEBREAKERS[Math.floor(Math.random()*len)].
+std::uint32_t secureUniform(std::uint32_t upperExclusive) {
+  if (upperExclusive == 0) throw std::invalid_argument("empty random range");
+  const std::uint64_t range =
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  const std::uint64_t limit = range - (range % upperExclusive);
+  std::uint32_t value = 0;
+  do {
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&value), sizeof(value)) != 1)
+      throw std::runtime_error("secure roulette selection failed");
+  } while (static_cast<std::uint64_t>(value) >= limit);
+  return value % upperExclusive;
+}
+
+// Pick a cryptographically unpredictable, unbiased icebreaker index.
 const std::string& randomIcebreaker() {
   const auto& pool = icebreakers();
-  static thread_local std::mt19937 rng{std::random_device{}()};
-  std::uniform_int_distribution<std::size_t> dist(0, pool.size() - 1);
-  return pool[dist(rng)];
+  return pool[secureUniform(static_cast<std::uint32_t>(pool.size()))];
 }
 
 // Read a Json field's value as a comparable id string. toJson renders ObjectId
@@ -82,6 +96,28 @@ std::string idString(const Json::Value& v) {
   if (v.isString()) return v.asString();
   if (v.isObject() && v.isMember("_id")) return v["_id"].asString();
   return v.asString();
+}
+
+// The active-status predicate is shared by queue admission, race recovery, and
+// the partial unique index that enforces one live session per user.
+bsoncxx::document::value activeStatuses() {
+  return make_document(kvp("$in", make_array(
+      "waiting", "matched", "chatting", "deciding")));
+}
+
+std::optional<Json::Value> findActiveSession(mongocxx::collection& col,
+                                             const std::string& userId) {
+  bld::document filter;
+  appendUserId(filter, "users.user", userId);
+  filter.append(kvp("status", activeStatuses()));
+  auto found = col.find_one(filter.view());
+  if (!found) return std::nullopt;
+  return sanitizeForOutput(bj::toJson(found->view()));
+}
+
+bool isDuplicateKey(const mongocxx::operation_exception& e) {
+  return e.code().value() == 11000 ||
+         std::string(e.what()).find("E11000") != std::string::npos;
 }
 
 } // namespace
@@ -121,6 +157,18 @@ void ensureIndexes() {
 
     // rouletteSchema.index({ 'users.user': 1 });
     col.create_index(make_document(kvp("users.user", 1)));
+
+    // Enforce the invariant the model methods rely on: a user may occur in at
+    // most one active roulette document. Completed/expired history remains
+    // unrestricted and immediately frees both participants for another match.
+    {
+      auto partial = make_document(kvp("status", activeStatuses()));
+      mongocxx::options::index opts{};
+      opts.name("uniq_active_roulette_user");
+      opts.unique(true);
+      opts.partial_filter_expression(partial.view());
+      col.create_index(make_document(kvp("users.user", 1)), opts);
+    }
 
     // rouletteSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     {
@@ -289,8 +337,7 @@ Json::Value joinQueue(const std::string& userId) {
     //           status: { $in: ['waiting','matched','chatting','deciding'] } })
     bld::document filter;
     appendUserId(filter, "users.user", userId);
-    filter.append(kvp("status", make_document(kvp(
-        "$in", make_array("waiting", "matched", "chatting", "deciding")))));
+    filter.append(kvp("status", activeStatuses()));
 
     auto existing = col.find_one(filter.view());
     if (existing) return sanitizeForOutput(bj::toJson(existing->view()));
@@ -334,7 +381,16 @@ Json::Value joinQueue(const std::string& userId) {
     insert.append(kvp("updatedAt", dateFromMillis(nowMs)));
     insert.append(kvp("__v", 0));
 
-    auto inserted = col.insert_one(insert.view());
+    bsoncxx::v_noabi::stdx::optional<mongocxx::result::insert_one> inserted;
+    try {
+      inserted = col.insert_one(insert.view());
+    } catch (const mongocxx::operation_exception& e) {
+      if (!isDuplicateKey(e)) throw;
+      // Another request admitted this user after our initial read. The partial
+      // unique index chose the winner; return that canonical active session.
+      if (auto raced = findActiveSession(col, userId)) return *raced;
+      throw;
+    }
     if (!inserted) return sanitizeForOutput(session);
 
     auto created = col.find_one(make_document(kvp("_id", inserted->inserted_id())));
@@ -351,9 +407,9 @@ std::optional<Json::Value> findMatch(const std::string& userId,
   try {
     auto col = pulse::db::collection(kCollection);
 
-    // find({ status:'waiting', 'users.user': { $ne: userId },
-    //        'users.0.joinedAt': { $gte: now - 5*60*1000 } })
-    //   .sort({ 'users.0.joinedAt': 1 }).limit(10)
+    // Atomically claim the longest-waiting eligible document. Keeping the full
+    // eligibility predicate in find_one_and_update means two matchers cannot
+    // both append themselves to the same one-person session.
     const long long nowMs = nowMillis();
     bld::document filter;
     filter.append(kvp("status", "waiting"));
@@ -366,18 +422,7 @@ std::optional<Json::Value> findMatch(const std::string& userId,
     filter.append(kvp("users.0.joinedAt",
                       make_document(kvp("$gte",
                           dateFromMillis(nowMs - 5LL * 60 * 1000)))));
-
-    mongocxx::options::find opts{};
-    opts.sort(make_document(kvp("users.0.joinedAt", 1)));
-    opts.limit(10);
-
-    auto cursor = col.find(filter.view(), opts);
-    bsoncxx::v_noabi::stdx::optional<bsoncxx::document::value> first;
-    for (const auto& doc : cursor) { first.emplace(doc); break; } // waiting[0]
-    if (!first) return std::nullopt;                              // waiting.length === 0
-
-    auto matchView = first->view();
-    auto idEl = matchView["_id"];
+    filter.append(kvp("users.1", make_document(kvp("$exists", false))));
 
     // Mutate waiting[0]:
     //   users.push({ user:userId, joinedAt:now })
@@ -396,13 +441,27 @@ std::optional<Json::Value> findMatch(const std::string& userId,
         kvp("status", "matched"),
         kvp("matchedAt", dateFromMillis(nowMs)),
         kvp("icebreaker", randomIcebreaker()),
-        kvp("expiresAt", dateFromMillis(nowMs + 15LL * 60 * 1000)))));
+        kvp("expiresAt", dateFromMillis(nowMs + 15LL * 60 * 1000)),
+        kvp("updatedAt", dateFromMillis(nowMs)))));
+    update.append(kvp("$inc", make_document(kvp("__v", 1))));
 
     mongocxx::options::find_one_and_update fouOpts{};
     fouOpts.return_document(mongocxx::options::return_document::k_after);
+    fouOpts.sort(make_document(kvp("users.0.joinedAt", 1)));
 
-    auto result = col.find_one_and_update(
-        make_document(kvp("_id", idEl.get_value())), update.view(), fouOpts);
+    bsoncxx::v_noabi::stdx::optional<bsoncxx::document::value> result;
+    try {
+      result = col.find_one_and_update(filter.view(), update.view(), fouOpts);
+    } catch (const mongocxx::operation_exception& e) {
+      if (!isDuplicateKey(e)) throw;
+      // A concurrent request already placed this user into an active session.
+      // Only surface it as a match when it really has a partner; a one-user
+      // waiting document must flow through joinQueue instead.
+      auto raced = findActiveSession(col, userId);
+      if (raced && (*raced)["users"].isArray() && (*raced)["users"].size() >= 2)
+        return raced;
+      return std::nullopt;
+    }
     if (!result) return std::nullopt;
     return sanitizeForOutput(bj::toJson(result->view()));
   } catch (const std::exception& e) {

@@ -18,6 +18,7 @@
 #include <mongocxx/cursor.hpp>
 #include <mongocxx/options/index.hpp>
 #include <mongocxx/options/find.hpp>
+#include <mongocxx/options/find_one_and_update.hpp>
 #include <mongocxx/options/update.hpp>
 
 #include <chrono>
@@ -242,7 +243,7 @@ Json::Value getActiveDrops(int limit) {
                             kvp("trendingScore", -1),
                             kvp("participantCount", -1)));
     // .limit(limit)
-    opts.limit(limit);
+    opts.limit(std::clamp(limit, 1, 100));
 
     Json::Value out(Json::arrayValue);
     auto cursor = col.find(filter.view(), opts);
@@ -329,10 +330,16 @@ std::optional<Json::Value> createFromViral(const std::string& postId,
     builder.append(kvp("trending", doc["trending"].asBool()));
     builder.append(kvp("trendingScore",
                        static_cast<std::int64_t>(doc["trendingScore"].asInt64())));
-    builder.append(kvp("startsAt", doc["startsAt"].asString()));
-    builder.append(kvp("expiresAt", doc["expiresAt"].asString()));
-    builder.append(kvp("createdAt", doc["createdAt"].asString()));
-    builder.append(kvp("updatedAt", doc["updatedAt"].asString()));
+    const auto asDate = [&](const char* field, long long fallbackMs) {
+      auto parsed = millisFromIso(doc[field].asString());
+      return bsoncxx::types::b_date{
+          std::chrono::milliseconds(parsed.value_or(fallbackMs))};
+    };
+    const long long insertNow = nowMillisLocal();
+    builder.append(kvp("startsAt", asDate("startsAt", insertNow)));
+    builder.append(kvp("expiresAt", asDate("expiresAt", insertNow + kTwentyFourHoursMs)));
+    builder.append(kvp("createdAt", asDate("createdAt", insertNow)));
+    builder.append(kvp("updatedAt", asDate("updatedAt", insertNow)));
     builder.append(kvp("__v", static_cast<std::int32_t>(doc["__v"].asInt())));
     builder.append(kvp("participants", make_array()));      // []
     builder.append(kvp("featuredResponses", make_array())); // []
@@ -387,117 +394,91 @@ JoinResult join(const std::string& dropId,
 
     auto dropOid = tryOid(dropId);
     if (!dropOid) return JoinResult{};  // invalid id -> not found
+    auto userOid = tryOid(userId);
+    auto responseOid = responsePostId.empty() ? std::optional<bsoncxx::oid>{}
+                                               : tryOid(responsePostId);
+    if (!userOid || (!responsePostId.empty() && !responseOid)) return JoinResult{};
 
-    auto existing = col.find_one(make_document(kvp("_id", *dropOid)));
-    if (!existing) return JoinResult{};  // no matching drop
+    mongocxx::options::find_one_and_update opts{};
+    opts.return_document(mongocxx::options::return_document::k_after);
 
-    auto view = existing->view();
+    auto resultFrom = [](const bsoncxx::document::view& view) {
+      JoinResult res;
+      res.found = true;
+      res.participantCount = readLong(view, "participantCount");
+      res.responseCount = readLong(view, "responseCount");
+      res.trendingScore = readLong(view, "trendingScore");
+      return res;
+    };
 
-    long long participantCount = readLong(view, "participantCount");
-    long long responseCount = readLong(view, "responseCount");
-
-    const bool hasResponse = !responsePostId.empty();
-    auto userOid = oid(userId);
-
-    // Determine whether userId is already a participant, mirroring:
-    //   this.participants.find(p => p.user.toString() === userId.toString())
-    bool alreadyJoined = false;
-    int participantIndex = -1;
-    {
-      auto pIt = view.find("participants");
-      if (pIt != view.end() && pIt->type() == bsoncxx::type::k_array) {
-        int idx = 0;
-        for (const auto& el : pIt->get_array().value) {
-          if (el.type() == bsoncxx::type::k_document) {
-            auto pdoc = el.get_document().value;
-            auto uIt = pdoc.find("user");
-            if (uIt != pdoc.end() && uIt->type() == bsoncxx::type::k_oid &&
-                uIt->get_oid().value == userOid) {
-              alreadyJoined = true;
-              participantIndex = idx;
-              break;
-            }
-          }
-          ++idx;
-        }
+    auto activeFilter = [&](bool requireNotJoined) {
+      bld::document filter;
+      filter.append(kvp("_id", *dropOid), kvp("status", kStatusActive),
+                    kvp("expiresAt", make_document(kvp("$gt", nowDate()))));
+      if (requireNotJoined) {
+        filter.append(kvp("participants.user",
+                          make_document(kvp("$ne", *userOid))));
       }
+      return filter.extract();
+    };
+
+    // First attempt to add the participant. The $ne predicate and $push/$inc
+    // are one atomic update, so concurrent joins for one user cannot duplicate
+    // the participant or counters.
+    auto participant = responseOid
+        ? make_document(kvp("user", *userOid), kvp("response", *responseOid),
+                        kvp("joinedAt", nowDate()))
+        : make_document(kvp("user", *userOid),
+                        kvp("response", bsoncxx::types::b_null{}),
+                        kvp("joinedAt", nowDate()));
+    bld::document joinUpdate;
+    joinUpdate.append(kvp("$push", make_document(kvp("participants", participant))));
+    joinUpdate.append(kvp("$inc", [&](bld::sub_document inc) {
+      inc.append(kvp("participantCount", 1));
+      inc.append(kvp("trendingScore", responseOid ? 7 : 2));
+      if (responseOid) inc.append(kvp("responseCount", 1));
+    }));
+    joinUpdate.append(kvp("$set", make_document(kvp("updatedAt", nowDate()))));
+    auto notJoined = activeFilter(true);
+    auto joined = col.find_one_and_update(notJoined.view(), joinUpdate.view(), opts);
+    if (joined) return resultFrom(joined->view());
+
+    if (responseOid) {
+      // Add the first response for an existing participant. Only a null/missing
+      // response matches, so responseCount is incremented exactly once.
+      auto firstResponseFilter = make_document(
+          kvp("_id", *dropOid), kvp("status", kStatusActive),
+          kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+          kvp("participants", make_document(kvp("$elemMatch", make_document(
+              kvp("user", *userOid),
+              kvp("response", bsoncxx::types::b_null{}))))));
+      auto firstResponseUpdate = make_document(
+          kvp("$set", make_document(kvp("participants.$.response", *responseOid),
+                                     kvp("updatedAt", nowDate()))),
+          kvp("$inc", make_document(kvp("responseCount", 1),
+                                     kvp("trendingScore", 5))));
+      auto firstResponse = col.find_one_and_update(
+          firstResponseFilter.view(), firstResponseUpdate.view(), opts);
+      if (firstResponse) return resultFrom(firstResponse->view());
+
+      // Replacing an existing response is idempotent with respect to counts.
+      auto replaceFilter = make_document(
+          kvp("_id", *dropOid), kvp("status", kStatusActive),
+          kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+          kvp("participants.user", *userOid));
+      auto replaceUpdate = make_document(kvp("$set", make_document(
+          kvp("participants.$.response", *responseOid),
+          kvp("updatedAt", nowDate()))));
+      auto replaced = col.find_one_and_update(
+          replaceFilter.view(), replaceUpdate.view(), opts);
+      if (replaced) return resultFrom(replaced->view());
     }
 
-    bsoncxx::builder::basic::document updateBuilder{};
-
-    if (alreadyJoined) {
-      // existing participant: if responsePostId, set its response + responseCount++
-      if (hasResponse) {
-        responseCount += 1;
-        std::string responseField =
-            "participants." + std::to_string(participantIndex) + ".response";
-        updateBuilder.append(kvp("$set", [&](bld::sub_document sd) {
-          sd.append(kvp(responseField, oid(responsePostId)));
-          sd.append(kvp("responseCount", static_cast<std::int64_t>(responseCount)));
-        }));
-      }
-      // else: nothing changes (JS save() is still called, but values are equal).
-    } else {
-      // push new participant { user, response, joinedAt: now }
-      participantCount += 1;
-      if (hasResponse) responseCount += 1;
-
-      bsoncxx::types::b_date joinedAt = nowDate();
-      auto participantDoc =
-          hasResponse
-              ? make_document(kvp("user", userOid),
-                              kvp("response", oid(responsePostId)),
-                              kvp("joinedAt", joinedAt))
-              // response defaults to null (responsePostId === null).
-              : make_document(kvp("user", userOid),
-                              kvp("response", bsoncxx::types::b_null{}),
-                              kvp("joinedAt", joinedAt));
-
-      updateBuilder.append(kvp("$push",
-          make_document(kvp("participants", participantDoc))));
-      updateBuilder.append(kvp("$set", [&](bld::sub_document sd) {
-        sd.append(kvp("participantCount", static_cast<std::int64_t>(participantCount)));
-        if (hasResponse)
-          sd.append(kvp("responseCount", static_cast<std::int64_t>(responseCount)));
-      }));
-    }
-
-    // this.trendingScore = this.participantCount * 2 + this.responseCount * 5;
-    long long trendingScore = participantCount * 2 + responseCount * 5;
-
-    // Always set the recomputed trendingScore (the JS recomputes + saves
-    // unconditionally). Merge into the existing $set when present.
-    {
-      bld::document finalUpdate{};
-      auto extracted = updateBuilder.extract();
-      auto uview = extracted.view();
-
-      bld::document setDoc{};
-      auto setIt = uview.find("$set");
-      if (setIt != uview.end() && setIt->type() == bsoncxx::type::k_document) {
-        for (const auto& el : setIt->get_document().value) {
-          setDoc.append(kvp(el.key(), el.get_value()));
-        }
-      }
-      setDoc.append(kvp("trendingScore", static_cast<std::int64_t>(trendingScore)));
-
-      // Carry over $push if it was set.
-      auto pushIt = uview.find("$push");
-      if (pushIt != uview.end()) {
-        finalUpdate.append(kvp("$push", pushIt->get_value()));
-      }
-      finalUpdate.append(kvp("$set", setDoc.extract()));
-
-      auto upd = finalUpdate.extract();
-      col.update_one(make_document(kvp("_id", *dropOid)), upd.view());
-    }
-
-    JoinResult res;
-    res.found = true;
-    res.participantCount = participantCount;
-    res.responseCount = responseCount;
-    res.trendingScore = trendingScore;
-    return res;
+    // Already joined with no response: return the current counters without a
+    // write. If the active filter no longer matches, the drop expired/raced out.
+    auto currentFilter = activeFilter(false);
+    auto current = col.find_one(currentFilter.view());
+    return current ? resultFrom(current->view()) : JoinResult{};
   } catch (const std::exception& e) {
     pulse::log::error("PulseDrop join failed: {}", e.what());
     throw;

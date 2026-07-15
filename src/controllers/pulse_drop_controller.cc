@@ -33,9 +33,13 @@
 
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
+#include <chrono>
 
 namespace pulse::controllers {
 
@@ -91,8 +95,10 @@ int queryInt(const drogon::HttpRequestPtr& req, const char* name, int def) {
   if (v.empty()) return def;
   char* end = nullptr;
   long n = std::strtol(v.c_str(), &end, 10);
-  if (end == v.c_str()) return def;
-  return static_cast<int>(n);
+  if (end == v.c_str() || *end != '\0') return def;
+  if (std::string(name) == "page")
+    return static_cast<int>(std::clamp<long>(n, 1, 1000000));
+  return static_cast<int>(std::clamp<long>(n, 1, 100));
 }
 
 // Read the authenticated userId set by AuthFilter on the request attributes.
@@ -168,13 +174,8 @@ void PulseDropController::getById(
   try {
     auto oid = pulse::bsonjson::tryOid(dropId);
     if (!oid) {
-      // Mongoose findById with an invalid ObjectId rejects -> caught -> 500
-      // with the CastError message. We surface a 404 only for a valid-but-
-      // missing id; an invalid id falls into the catch like the JS does.
-      // To preserve the JS control flow precisely, treat the cast failure as a
-      // thrown error (500) rather than a 404.
-      throw std::runtime_error(
-          "Cast to ObjectId failed for value \"" + dropId + "\" (type string) at path \"_id\" for model \"PulseDrop\"");
+      callback(failMessage(drogon::k400BadRequest, "Invalid drop ID"));
+      return;
     }
 
     auto col = pulse::db::collection(pulse::models::pulsedrop::kCollection);
@@ -223,9 +224,8 @@ void PulseDropController::join(
 
     auto oid = pulse::bsonjson::tryOid(dropId);
     if (!oid) {
-      // findById cast failure -> JS catch -> 500.
-      throw std::runtime_error(
-          "Cast to ObjectId failed for value \"" + dropId + "\" (type string) at path \"_id\" for model \"PulseDrop\"");
+      callback(failMessage(drogon::k400BadRequest, "Invalid drop ID"));
+      return;
     }
 
     auto col = pulse::db::collection(pulse::models::pulsedrop::kCollection);
@@ -250,9 +250,35 @@ void PulseDropController::join(
       return;
     }
 
+    if (!responsePostId.empty()) {
+      auto responseOid = pulse::bsonjson::tryOid(responsePostId);
+      auto userOid = pulse::bsonjson::tryOid(userId);
+      if (!responseOid || !userOid) {
+        callback(failMessage(drogon::k400BadRequest, "Invalid response post"));
+        return;
+      }
+      // A response reference must be an active post owned by the caller and
+      // created for this drop. This prevents arbitrary ObjectId attachment and
+      // response-count inflation using unrelated posts.
+      auto postCol = pulse::db::collection(pulse::models::post::kCollection);
+      auto response = postCol.find_one(make_document(
+          kvp("_id", *responseOid), kvp("author", *userOid),
+          kvp("isActive", true), kvp("metadata.pulseDropId", dropId)));
+      if (!response) {
+        callback(failMessage(drogon::k400BadRequest,
+                             "Response post does not belong to this drop"));
+        return;
+      }
+    }
+
     // await drop.join(userId, responsePostId);  (responsePostId "" == JS null)
     auto result =
         pulse::models::pulsedrop::join(dropId, userId, responsePostId);
+    if (!result.found) {
+      callback(failMessage(drogon::k409Conflict,
+                           "Drop is no longer active"));
+      return;
+    }
 
     // res.json({ success:true, data: { participantCount, responseCount } })
     // The JS reads drop.participantCount / drop.responseCount AFTER join()
@@ -290,27 +316,50 @@ void PulseDropController::createResponse(
     auto body = req->getJsonObject();
     const std::string userId = authUserId(req);
 
+    if (!body || !body->isObject() || !body->isMember("content") ||
+        !(*body)["content"].isObject()) {
+      callback(failMessage(drogon::k400BadRequest,
+                           "Response content is required"));
+      return;
+    }
+    const Json::Value& responseContent = (*body)["content"];
+    const bool hasText = responseContent.isMember("text") &&
+                         responseContent["text"].isString() &&
+                         !responseContent["text"].asString().empty();
+    const bool hasContentMedia = responseContent.isMember("media") &&
+                                 responseContent["media"].isArray() &&
+                                 !responseContent["media"].empty();
+    const bool hasTopMedia = body->isMember("media") &&
+                             (*body)["media"].isArray() &&
+                             !(*body)["media"].empty();
+    if ((responseContent.isMember("text") &&
+         (!responseContent["text"].isString() ||
+          responseContent["text"].asString().size() > 5000)) ||
+        (responseContent.isMember("media") &&
+         (!responseContent["media"].isArray() ||
+          responseContent["media"].size() > 10)) ||
+        (body->isMember("media") &&
+         (!(*body)["media"].isArray() || (*body)["media"].size() > 10)) ||
+        (!hasText && !hasContentMedia && !hasTopMedia)) {
+      callback(failMessage(drogon::k400BadRequest,
+                           "Invalid response content"));
+      return;
+    }
+
     auto oid = pulse::bsonjson::tryOid(dropId);
     if (!oid) {
-      throw std::runtime_error(
-          "Cast to ObjectId failed for value \"" + dropId + "\" (type string) at path \"_id\" for model \"PulseDrop\"");
+      callback(failMessage(drogon::k400BadRequest, "Invalid drop ID"));
+      return;
     }
 
     auto dropCol = pulse::db::collection(pulse::models::pulsedrop::kCollection);
-    auto found = dropCol.find_one(make_document(kvp("_id", *oid)));
+    auto found = dropCol.find_one(make_document(
+        kvp("_id", *oid), kvp("status", pulse::models::pulsedrop::kStatusActive),
+        kvp("expiresAt", make_document(kvp(
+            "$gt", bsoncxx::types::b_date{std::chrono::system_clock::now()})))));
 
     // if (!drop || drop.status !== 'active') -> 404 'Active drop not found'
-    bool active = false;
-    if (found) {
-      auto view = found->view();
-      auto it = view.find("status");
-      if (it != view.end() && it->type() == bsoncxx::type::k_string &&
-          std::string(it->get_string().value) ==
-              pulse::models::pulsedrop::kStatusActive) {
-        active = true;
-      }
-    }
-    if (!found || !active) {
+    if (!found) {
       callback(failMessage(drogon::k404NotFound, "Active drop not found"));
       return;
     }
@@ -346,6 +395,8 @@ void PulseDropController::createResponse(
     // with an ObjectId.
     Json::Value forBson = postDoc;
     forBson.removeMember("author");
+    forBson.removeMember("createdAt");
+    forBson.removeMember("updatedAt");
     auto baseDoc = pulse::bsonjson::fromJson(forBson);
 
     bld::document insert{};
@@ -353,6 +404,9 @@ void PulseDropController::createResponse(
     for (const auto& el : baseDoc.view()) {
       insert.append(kvp(el.key(), el.get_value()));
     }
+    const auto postNow = bsoncxx::types::b_date{std::chrono::system_clock::now()};
+    insert.append(kvp("createdAt", postNow));
+    insert.append(kvp("updatedAt", postNow));
     auto insertDoc = insert.extract();
     auto inserted = postCol.insert_one(insertDoc.view());
 
@@ -367,7 +421,16 @@ void PulseDropController::createResponse(
     post["author"] = userId;
 
     // await drop.join(userId, post._id);
-    pulse::models::pulsedrop::join(dropId, userId, postIdHex);
+    auto joinResult = pulse::models::pulsedrop::join(dropId, userId, postIdHex);
+    if (!joinResult.found) {
+      if (auto postOid = pulse::bsonjson::tryOid(postIdHex)) {
+        postCol.delete_one(make_document(kvp("_id", *postOid),
+                                         kvp("author", pulse::bsonjson::oid(userId))));
+      }
+      callback(failMessage(drogon::k409Conflict,
+                           "Drop is no longer active"));
+      return;
+    }
 
     // res.status(201).json({ success:true, data: post })
     callback(okData(std::move(post), drogon::k201Created));
@@ -402,8 +465,8 @@ void PulseDropController::getResponses(
 
     auto oid = pulse::bsonjson::tryOid(dropId);
     if (!oid) {
-      throw std::runtime_error(
-          "Cast to ObjectId failed for value \"" + dropId + "\" (type string) at path \"_id\" for model \"PulseDrop\"");
+      callback(failMessage(drogon::k400BadRequest, "Invalid drop ID"));
+      return;
     }
 
     auto dropCol = pulse::db::collection(pulse::models::pulsedrop::kCollection);
@@ -436,11 +499,12 @@ void PulseDropController::getResponses(
     // Post.find({ _id: { $in: responseIds } })
     //   .sort({ 'stats.likes': -1 }).skip((page-1)*limit).limit(limit)
     auto filter = make_document(
-        kvp("_id", make_document(kvp("$in", responseIds.extract()))));
+        kvp("_id", make_document(kvp("$in", responseIds.extract()))),
+        kvp("isActive", true));
 
     mongocxx::options::find opts{};
     opts.sort(make_document(kvp("stats.likes", -1)));
-    opts.skip(static_cast<std::int64_t>((page - 1) * limit));
+    opts.skip((static_cast<std::int64_t>(page) - 1) * limit);
     opts.limit(limit);
 
     Json::Value responses(Json::arrayValue);
@@ -483,6 +547,43 @@ void PulseDropController::createDrop(
         (*body)["durationHours"].isNumeric()) {
       durationHours = (*body)["durationHours"].asDouble();
     }
+    if (!body || !body->isObject() || !body->isMember("title") ||
+        !(*body)["title"].isString() || (*body)["title"].asString().empty() ||
+        (*body)["title"].asString().size() > 120) {
+      callback(failMessage(drogon::k400BadRequest,
+                           "A title of at most 120 characters is required"));
+      return;
+    }
+    if (!std::isfinite(durationHours) || durationHours < 1.0 ||
+        durationHours > 720.0) {
+      callback(failMessage(drogon::k400BadRequest,
+                           "durationHours must be between 1 and 720"));
+      return;
+    }
+    if (body->isMember("description") &&
+        (!(*body)["description"].isString() ||
+         (*body)["description"].asString().size() > 2000)) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid description"));
+      return;
+    }
+    if (body->isMember("coverImage") &&
+        (!(*body)["coverImage"].isString() ||
+         (*body)["coverImage"].asString().size() > 2048)) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid cover image"));
+      return;
+    }
+    if (body->isMember("hashtags")) {
+      if (!(*body)["hashtags"].isArray() || (*body)["hashtags"].size() > 20) {
+        callback(failMessage(drogon::k400BadRequest, "Invalid hashtags"));
+        return;
+      }
+      for (const auto& hashtag : (*body)["hashtags"]) {
+        if (!hashtag.isString() || hashtag.asString().size() > 64) {
+          callback(failMessage(drogon::k400BadRequest, "Invalid hashtags"));
+          return;
+        }
+      }
+    }
 
     // Build the insert JSON literal, then apply schema defaults (which also
     // stamps participantCount/responseCount/startsAt/status/etc.). We override
@@ -511,11 +612,25 @@ void PulseDropController::createDrop(
 
     doc = pulse::models::pulsedrop::applyDefaults(std::move(doc));
 
-    // Persist via the BSON builder. expiresAt/startsAt/createdAt/updatedAt are
-    // ISO strings in the JSON; convert through fromJson which preserves them.
-    auto baseDoc = pulse::bsonjson::fromJson(doc);
+    // Persist lifecycle fields as BSON Dates so active-range queries and expiry
+    // jobs use the same schema as the Node backend.
+    Json::Value nonDates = doc;
+    nonDates.removeMember("startsAt");
+    nonDates.removeMember("expiresAt");
+    nonDates.removeMember("createdAt");
+    nonDates.removeMember("updatedAt");
+    auto baseDoc = pulse::bsonjson::fromJson(nonDates);
+    bld::document insert{};
+    for (const auto& el : baseDoc.view()) insert.append(kvp(el.key(), el.get_value()));
+    const auto now = std::chrono::system_clock::now();
+    insert.append(kvp("startsAt", bsoncxx::types::b_date{now}));
+    insert.append(kvp("expiresAt", bsoncxx::types::b_date{
+        std::chrono::milliseconds(expiresMs)}));
+    insert.append(kvp("createdAt", bsoncxx::types::b_date{now}));
+    insert.append(kvp("updatedAt", bsoncxx::types::b_date{now}));
+    auto insertDoc = insert.extract();
     auto col = pulse::db::collection(pulse::models::pulsedrop::kCollection);
-    auto inserted = col.insert_one(baseDoc.view());
+    auto inserted = col.insert_one(insertDoc.view());
 
     Json::Value out = doc;
     if (inserted && inserted->inserted_id().type() == bsoncxx::type::k_oid) {
