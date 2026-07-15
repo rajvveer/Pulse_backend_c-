@@ -16,6 +16,7 @@
 #include "pulse/logger.hpp"
 
 #include "pulse/models/bookmark.hpp"
+#include "pulse/models/follow.hpp"
 #include "pulse/models/post.hpp"
 #include "pulse/models/reel.hpp"
 #include "pulse/models/user.hpp"
@@ -37,6 +38,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -69,17 +71,6 @@ std::string authUserId(const Json::Value& user) {
   return "";
 }
 
-// Append a ref field (ObjectId) from a hex string to a builder: a 24-hex string
-// coerces to bsoncxx::oid (Mongoose ref/_id casting), any other string is kept
-// verbatim. Mirrors Mongoose CastError-free path for valid ids.
-void appendRef(bld::document& doc, const std::string& key, const std::string& hex) {
-  if (auto id = bj::tryOid(hex)) {
-    doc.append(kvp(key, *id));
-    return;
-  }
-  doc.append(kvp(key, hex));
-}
-
 // JS Number.parseInt(x, 10): parse a leading optional-sign integer prefix,
 // ignoring leading whitespace; returns std::nullopt for NaN (no leading digits).
 std::optional<long long> parseIntJs(const std::string& s) {
@@ -95,6 +86,13 @@ std::optional<long long> parseIntJs(const std::string& s) {
   } catch (...) {
     return std::nullopt;
   }
+}
+
+long long clampedParam(const std::string& raw, long long fallback,
+                       long long lo, long long hi) {
+  auto parsed = parseIntJs(raw);
+  long long value = (!parsed || *parsed == 0) ? fallback : *parsed;
+  return std::max(lo, std::min(hi, value));
 }
 
 // hex _id from a (lean) doc.
@@ -131,7 +129,7 @@ void populateUsers(Json::Value& docs, const std::string& key) {
       if (auto o = bj::tryOid(hex)) in.append(*o);
     auto filter = make_document(kvp("_id", make_document(kvp("$in", in.extract()))));
     auto projection = make_document(kvp("username", 1), kvp("name", 1),
-                                    kvp("avatar", 1), kvp("profile", 1),
+                                    kvp("avatar", 1), kvp("profile.avatar", 1),
                                     kvp("isVerified", 1));
     mongocxx::options::find opts{};
     opts.projection(projection.view());
@@ -171,6 +169,39 @@ bool postIsLikedBy(const Json::Value& post, const std::string& userId) {
     if (hex == userId) return true;
   }
   return false;
+}
+
+std::string postAuthorId(const Json::Value& post) {
+  if (!post.isObject() || !post.isMember("author")) return "";
+  const Json::Value& author = post["author"];
+  if (author.isString()) return author.asString();
+  if (author.isObject() && author.isMember("_id") && author["_id"].isString())
+    return author["_id"].asString();
+  return "";
+}
+
+bool canViewPost(const Json::Value& post, const std::string& viewerId,
+                 const std::set<std::string>* following = nullptr) {
+  if (!post.isObject() || !post.get("isActive", true).asBool()) return false;
+
+  const std::string ownerId = postAuthorId(post);
+  if (!viewerId.empty() && ownerId == viewerId) return true;
+
+  const std::string visibility = post.get("visibility", "public").asString();
+  if (visibility == "public") return true;
+  if (visibility != "followers" || viewerId.empty() || ownerId.empty())
+    return false;
+
+  if (following) return following->count(ownerId) != 0;
+  return pulse::models::follow::isFollowing(viewerId, ownerId);
+}
+
+HttpResponsePtr failMessage(drogon::HttpStatusCode status,
+                            const std::string& message) {
+  Json::Value body(Json::objectValue);
+  body["success"] = false;
+  body["message"] = message;
+  return pulse::http::json(status, std::move(body));
 }
 
 // 500 handler shape: res.status(500).json({ success:false, message:error.message }).
@@ -225,12 +256,19 @@ void BookmarkController::toggleBookmark(
       return;
     }
 
+    auto userOid = bj::tryOid(userId);
+    auto itemOid = bj::tryOid(itemId);
+    if (!userOid || !itemOid) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid user or item id"));
+      return;
+    }
+
     auto bookmarks = pulse::db::collection(pulse::models::bookmark::kCollection);
 
     // Bookmark.findOne({ user: userId, itemId, itemType })
     bld::document findFilter;
-    appendRef(findFilter, "user", userId);
-    appendRef(findFilter, "itemId", itemId);
+    findFilter.append(kvp("user", *userOid));
+    findFilter.append(kvp("itemId", *itemOid));
     findFilter.append(kvp("itemType", itemType));
     auto existing = bookmarks.find_one(findFilter.view());
 
@@ -241,16 +279,16 @@ void BookmarkController::toggleBookmark(
       std::string existingId = docHexId(existingJson);
       if (auto o = bj::tryOid(existingId)) delFilter.append(kvp("_id", *o));
       else delFilter.append(kvp("_id", existingId));
-      bookmarks.delete_one(delFilter.view());
+      auto deleted = bookmarks.delete_one(delFilter.view());
+      const bool didDelete = deleted && deleted->deleted_count() == 1;
 
       // Decrement saves count for reels.
-      if (itemType == pulse::models::bookmark::kItemTypeReel) {
+      if (didDelete && itemType == pulse::models::bookmark::kItemTypeReel) {
         auto reels = pulse::db::collection(pulse::models::reel::kCollection);
-        bld::document rf;
-        if (auto o = bj::tryOid(itemId)) rf.append(kvp("_id", *o));
-        else rf.append(kvp("_id", itemId));
         reels.update_one(
-            rf.view(),
+            make_document(
+                kvp("_id", *itemOid),
+                kvp("stats.saves", make_document(kvp("$gt", 0)))),
             make_document(kvp("$inc", make_document(kvp("stats.saves", -1)))));
       }
 
@@ -258,6 +296,26 @@ void BookmarkController::toggleBookmark(
       Json::Value data(Json::objectValue);
       data["isBookmarked"] = false;
       callback(pulse::http::ok(data, drogon::k200OK));
+      return;
+    }
+
+    // Adding a bookmark requires an existing target visible to the caller.
+    // Removing a stale bookmark above remains possible after its target goes.
+    bool targetAccessible = false;
+    if (itemType == pulse::models::bookmark::kItemTypePost) {
+      auto posts = pulse::db::collection(pulse::models::post::kCollection);
+      auto found = posts.find_one(make_document(
+          kvp("_id", *itemOid), kvp("isActive", true)));
+      targetAccessible = found && canViewPost(bj::toJson(found->view()), userId);
+    } else {
+      auto reels = pulse::db::collection(pulse::models::reel::kCollection);
+      auto found = reels.find_one(make_document(
+          kvp("_id", *itemOid),
+          kvp("isActive", make_document(kvp("$ne", false)))));
+      targetAccessible = static_cast<bool>(found);
+    }
+    if (!targetAccessible) {
+      callback(failMessage(drogon::k404NotFound, "Item not found"));
       return;
     }
 
@@ -272,8 +330,8 @@ void BookmarkController::toggleBookmark(
       bsoncxx::oid newId;
       bld::document insert;
       insert.append(kvp("_id", newId));
-      appendRef(insert, "user", userId);
-      appendRef(insert, "itemId", itemId);
+      insert.append(kvp("user", *userOid));
+      insert.append(kvp("itemId", *itemOid));
       insert.append(kvp("itemType", itemType));
       long long now = nowMillis();
       insert.append(kvp("createdAt", bsoncxx::types::b_date{std::chrono::milliseconds{now}}));
@@ -285,11 +343,8 @@ void BookmarkController::toggleBookmark(
     // Increment saves count for reels.
     if (itemType == pulse::models::bookmark::kItemTypeReel) {
       auto reels = pulse::db::collection(pulse::models::reel::kCollection);
-      bld::document rf;
-      if (auto o = bj::tryOid(itemId)) rf.append(kvp("_id", *o));
-      else rf.append(kvp("_id", itemId));
       reels.update_one(
-          rf.view(),
+          make_document(kvp("_id", *itemOid)),
           make_document(kvp("$inc", make_document(kvp("stats.saves", 1)))));
     }
 
@@ -320,16 +375,26 @@ void BookmarkController::getBookmarks(
     std::string typeRaw = req->getParameter("type");
     std::string type = typeRaw.empty() ? "post" : typeRaw;
 
+    if (type != pulse::models::bookmark::kItemTypePost &&
+        type != pulse::models::bookmark::kItemTypeReel) {
+      callback(failMessage(drogon::k400BadRequest,
+                           "type must be post or reel"));
+      return;
+    }
+
+    auto userOid = bj::tryOid(userId);
+    if (!userOid) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid user id"));
+      return;
+    }
+
     std::string pageRaw = req->getParameter("page");
     std::string limitRaw = req->getParameter("limit");
 
     // parseInt(page) / parseInt(limit) with JS defaults 1 / 20 (numbers when the
     // query param is absent).
-    long long page = pageRaw.empty() ? 1 : parseIntJs(pageRaw).value_or(0);
-    long long limit = limitRaw.empty() ? 20 : parseIntJs(limitRaw).value_or(0);
-    // echoed values in pagination are parseInt(page)/parseInt(limit).
-    long long pageEcho = pageRaw.empty() ? 1 : parseIntJs(pageRaw).value_or(0);
-    long long limitEcho = limitRaw.empty() ? 20 : parseIntJs(limitRaw).value_or(0);
+    long long page = clampedParam(pageRaw, 1, 1, 10000);
+    long long limit = clampedParam(limitRaw, 20, 1, 100);
 
     long long skip = (page - 1) * limit;
 
@@ -339,7 +404,7 @@ void BookmarkController::getBookmarks(
     {
       auto bookmarks = pulse::db::collection(pulse::models::bookmark::kCollection);
       bld::document filter;
-      appendRef(filter, "user", userId);
+      filter.append(kvp("user", *userOid));
       filter.append(kvp("itemType", type));
       mongocxx::options::find opts{};
       opts.sort(make_document(kvp("createdAt", -1)));
@@ -371,7 +436,14 @@ void BookmarkController::getBookmarks(
           kvp("_id", make_document(kvp("$in", in.extract()))),
           kvp("isActive", true));
       auto cursor = posts.find(filter.view());
-      for (const auto& d : cursor) items.append(bj::toJson(d));
+      std::set<std::string> following;
+      for (const auto& id : pulse::models::follow::getFollowingIds(userId))
+        following.insert(id);
+      for (const auto& d : cursor) {
+        Json::Value post = bj::toJson(d);
+        if (canViewPost(post, userId, &following))
+          items.append(pulse::models::post::sanitizeForOutput(std::move(post)));
+      }
       populateUsers(items, "author");
 
       // items = items.map(post => ({ ...post,
@@ -388,9 +460,12 @@ void BookmarkController::getBookmarks(
       bld::array in;
       for (const auto& id : itemIds)
         if (auto o = bj::tryOid(id)) in.append(*o);
-      auto filter = make_document(kvp("_id", make_document(kvp("$in", in.extract()))));
+      auto filter = make_document(
+          kvp("_id", make_document(kvp("$in", in.extract()))),
+          kvp("isActive", make_document(kvp("$ne", false))));
       auto cursor = reels.find(filter.view());
-      for (const auto& d : cursor) items.append(bj::toJson(d));
+      for (const auto& d : cursor)
+        items.append(pulse::models::reel::sanitizeForOutput(bj::toJson(d)));
       populateUsers(items, "user");
 
       // items = items.map(reel => ({ ...reel, isSaved: true }))
@@ -415,8 +490,8 @@ void BookmarkController::getBookmarks(
     Json::Value extra(Json::objectValue);
     extra["data"] = ordered;
     Json::Value pagination(Json::objectValue);
-    pagination["page"] = static_cast<Json::Int64>(pageEcho);
-    pagination["limit"] = static_cast<Json::Int64>(limitEcho);
+    pagination["page"] = static_cast<Json::Int64>(page);
+    pagination["limit"] = static_cast<Json::Int64>(limit);
     extra["pagination"] = pagination;
     callback(pulse::http::success(extra, drogon::k200OK));
     return;
@@ -439,11 +514,18 @@ void BookmarkController::checkBookmark(
     Json::Value user = authUser(req);
     std::string userId = authUserId(user);
 
+    auto userOid = bj::tryOid(userId);
+    auto itemOid = bj::tryOid(itemId);
+    if (!userOid || !itemOid) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid user or item id"));
+      return;
+    }
+
     // Bookmark.findOne({ user: userId, itemId })
     auto bookmarks = pulse::db::collection(pulse::models::bookmark::kCollection);
     bld::document filter;
-    appendRef(filter, "user", userId);
-    appendRef(filter, "itemId", itemId);
+    filter.append(kvp("user", *userOid));
+    filter.append(kvp("itemId", *itemOid));
     auto exists = bookmarks.find_one(filter.view());
 
     // res.json({ success: true, data: { isBookmarked: !!exists } })
