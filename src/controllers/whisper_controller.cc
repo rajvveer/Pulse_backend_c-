@@ -24,12 +24,15 @@
 #include <bsoncxx/types.hpp>
 #include <bsoncxx/oid.hpp>
 #include <mongocxx/collection.hpp>
+#include <mongocxx/options/find_one_and_update.hpp>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
+#include <stdexcept>
 #include <string>
 
 using namespace drogon;
@@ -150,21 +153,48 @@ void WhisperController::getNearby(
     const std::string radiusStr = req->getParameter("radius");
     const std::string limitStr = req->getParameter("limit");
 
-    // if (!lng || !lat) -> 400 Location coordinates required
-    if (!truthyStr(lngStr) || !truthyStr(latStr)) {
+    if (lngStr.empty() || latStr.empty()) {
       callback(msgError(k400BadRequest, "Location coordinates required"));
       return;
     }
 
-    const double lng = [&] { try { return std::stod(lngStr); } catch (...) { return 0.0; } }();
-    const double lat = [&] { try { return std::stod(latStr); } catch (...) { return 0.0; } }();
+    double lng = 0.0, lat = 0.0;
+    try {
+      size_t lngEnd = 0, latEnd = 0;
+      lng = std::stod(lngStr, &lngEnd);
+      lat = std::stod(latStr, &latEnd);
+      if (lngEnd != lngStr.size() || latEnd != latStr.size() ||
+          !std::isfinite(lng) || !std::isfinite(lat) ||
+          lng < -180.0 || lng > 180.0 || lat < -90.0 || lat > 90.0) {
+        throw std::invalid_argument("coordinate range");
+      }
+    } catch (...) {
+      callback(msgError(k400BadRequest, "Invalid location coordinates"));
+      return;
+    }
     // radius = 5, limit = 50 defaults (parseFloat / parseInt of provided value).
-    const double radius = truthyStr(radiusStr)
-                              ? [&] { try { return std::stod(radiusStr); } catch (...) { return 5.0; } }()
-                              : 5.0;
-    const int limit = truthyStr(limitStr)
-                          ? [&] { try { return std::stoi(limitStr); } catch (...) { return 50; } }()
-                          : 50;
+    double parsedRadius = 5.0;
+    int parsedLimit = 50;
+    try {
+      if (truthyStr(radiusStr)) {
+        size_t end = 0;
+        parsedRadius = std::stod(radiusStr, &end);
+        if (end != radiusStr.size() || !std::isfinite(parsedRadius) ||
+            parsedRadius <= 0.0)
+          throw std::invalid_argument("radius");
+      }
+      if (truthyStr(limitStr)) {
+        size_t end = 0;
+        parsedLimit = std::stoi(limitStr, &end);
+        if (end != limitStr.size() || parsedLimit <= 0)
+          throw std::invalid_argument("limit");
+      }
+    } catch (...) {
+      callback(msgError(k400BadRequest, "Invalid radius or limit"));
+      return;
+    }
+    const double radius = std::clamp(parsedRadius, 0.1, 50.0);
+    const int limit = std::clamp(parsedLimit, 1, 100);
 
     Json::Value whispers = pulse::models::whisper::getNearby(lng, lat, radius, limit);
 
@@ -217,18 +247,30 @@ void WhisperController::create(
 
     // if (!content?.trim()) -> 400 Content is required
     const std::string content = contentV.isString() ? trimStr(contentV.asString()) : std::string();
-    if (content.empty()) {
-      callback(msgError(k400BadRequest, "Content is required"));
+    if (content.empty() || content.size() > 2000) {
+      callback(msgError(k400BadRequest,
+                        "Content must be between 1 and 2000 characters"));
       return;
     }
-    // if (!lng || !lat) -> 400 Location is required
-    if (!truthyJson(lngV) || !truthyJson(latV)) {
+    if (!lngV.isNumeric() || !latV.isNumeric()) {
       callback(msgError(k400BadRequest, "Location is required"));
       return;
     }
 
     const double lng = toDouble(lngV);
     const double lat = toDouble(latV);
+    if (!std::isfinite(lng) || !std::isfinite(lat) ||
+        lng < -180.0 || lng > 180.0 || lat < -90.0 || lat > 90.0) {
+      callback(msgError(k400BadRequest, "Invalid location coordinates"));
+      return;
+    }
+    for (const char* field : {"city", "region"}) {
+      if (body.isMember(field) &&
+          (!body[field].isString() || body[field].asString().size() > 100)) {
+        callback(msgError(k400BadRequest, "Invalid location label"));
+        return;
+      }
+    }
 
     // Whisper.create({ content: content.trim(), author: userId,
     //   location: { type:'Point', coordinates:[lng,lat] }, city, region })
@@ -267,9 +309,11 @@ void WhisperController::create(
     builder.append(kvp("replies", make_array()));
     builder.append(kvp("reports", static_cast<std::int64_t>(doc["reports"].asInt64())));
     builder.append(kvp("isHidden", doc["isHidden"].asBool()));
-    builder.append(kvp("expiresAt", doc["expiresAt"].asString()));
-    builder.append(kvp("createdAt", doc["createdAt"].asString()));
-    builder.append(kvp("updatedAt", doc["updatedAt"].asString()));
+    const auto now = std::chrono::system_clock::now();
+    builder.append(kvp("expiresAt", bsoncxx::types::b_date{
+        now + std::chrono::milliseconds(pulse::models::whisper::kExpiryTtlMs)}));
+    builder.append(kvp("createdAt", bsoncxx::types::b_date{now}));
+    builder.append(kvp("updatedAt", bsoncxx::types::b_date{now}));
 
     auto insertDoc = builder.extract();
     auto result = pulse::db::collection(pulse::models::whisper::kCollection)
@@ -313,13 +357,18 @@ void WhisperController::vote(
       callback(msgError(k400BadRequest, "Invalid vote type"));
       return;
     }
+    if (!pulse::bsonjson::tryOid(whisperId)) {
+      callback(msgError(k400BadRequest, "Invalid whisper ID"));
+      return;
+    }
 
     // const result = await Whisper.vote(whisperId, userId, voteType);
     // The JS static throws new Error('Whisper not found') when absent; that
     // propagates to the catch -> 500 { message: error.message }.
     auto result = pulse::models::whisper::vote(whisperId, userId, voteType);
     if (!result) {
-      throw std::runtime_error("Whisper not found");
+      callback(msgError(k404NotFound, "Whisper not found"));
+      return;
     }
 
     Json::Value data(Json::objectValue);
@@ -349,6 +398,12 @@ void WhisperController::reply(
     // const { content } = req.body;
     const std::string content = body.get("content", "").asString();
 
+    if (content.empty() || content.size() > 2000) {
+      callback(msgError(k400BadRequest,
+                        "Reply content must be between 1 and 2000 characters"));
+      return;
+    }
+
     // const userId = req.user.userId;
     const Json::Value user = req->getAttributes()->get<Json::Value>("user");
     const std::string userId = user.get("userId", "").asString();
@@ -357,8 +412,8 @@ void WhisperController::reply(
     // if (!whisper) -> 404 Whisper not found
     auto whisperOid = pulse::bsonjson::tryOid(whisperId);
     if (!whisperOid) {
-      // Mongoose findById(invalidId) throws CastError -> caught -> 500.
-      throw std::runtime_error("Cast to ObjectId failed");
+      callback(msgError(k400BadRequest, "Invalid whisper ID"));
+      return;
     }
     auto existing = pulse::db::collection(pulse::models::whisper::kCollection)
                         .find_one(make_document(kvp("_id", *whisperOid)));
@@ -394,38 +449,59 @@ void WhisperController::report(
     const HttpRequestPtr& req,
     std::function<void(const HttpResponsePtr&)>&& callback,
     std::string whisperId) {
-  (void)req;
   try {
     // const whisper = await Whisper.findById(whisperId);
     // if (!whisper) -> 404 Whisper not found
     auto whisperOid = pulse::bsonjson::tryOid(whisperId);
     if (!whisperOid) {
-      // Mongoose findById(invalidId) throws CastError -> caught -> 500.
-      throw std::runtime_error("Cast to ObjectId failed");
+      callback(msgError(k400BadRequest, "Invalid whisper ID"));
+      return;
     }
     auto col = pulse::db::collection(pulse::models::whisper::kCollection);
-    auto existing = col.find_one(make_document(kvp("_id", *whisperOid)));
+    auto existing = col.find_one(make_document(
+        kvp("_id", *whisperOid),
+        kvp("expiresAt", make_document(kvp(
+            "$gt", bsoncxx::types::b_date{std::chrono::system_clock::now()}))),
+        kvp("isHidden", make_document(kvp("$ne", true)))));
     if (!existing) {
       callback(msgError(k404NotFound, "Whisper not found"));
       return;
     }
 
-    // whisper.reports++; if (whisper.reports >= 5) whisper.isHidden = true;
-    // await whisper.save();
-    Json::Value whisper = pulse::bsonjson::toJson(existing->view());
-    long long reports = whisper.isMember("reports") ? whisper["reports"].asInt64() : 0;
-    ++reports;
-    const bool isHidden = reports >= 5;
-
-    bld::document setDoc{};
-    setDoc.append(kvp("reports", static_cast<std::int64_t>(reports)));
-    if (isHidden) {
-      setDoc.append(kvp("isHidden", true));
+    const Json::Value auth = req->getAttributes()->get<Json::Value>("user");
+    auto reporterOid = pulse::bsonjson::tryOid(auth.get("userId", "").asString());
+    if (!reporterOid) {
+      callback(msgError(k401Unauthorized, "Authentication required"));
+      return;
     }
-    setDoc.append(kvp("updatedAt", bsoncxx::types::b_date{std::chrono::system_clock::now()}));
 
-    col.update_one(make_document(kvp("_id", *whisperOid)),
-                   make_document(kvp("$set", setDoc.extract())));
+    // Record each reporter once and increment atomically. The predicate makes
+    // duplicate/concurrent reports by the same account idempotent.
+    mongocxx::options::find_one_and_update opts{};
+    opts.return_document(mongocxx::options::return_document::k_after);
+    auto updated = col.find_one_and_update(
+        make_document(kvp("_id", *whisperOid),
+                      kvp("expiresAt", make_document(kvp(
+                          "$gt", bsoncxx::types::b_date{
+                                     std::chrono::system_clock::now()}))),
+                      kvp("isHidden", make_document(kvp("$ne", true))),
+                      kvp("reportedBy", make_document(kvp("$ne", *reporterOid)))),
+        make_document(
+            kvp("$addToSet", make_document(kvp("reportedBy", *reporterOid))),
+            kvp("$inc", make_document(kvp("reports", 1))),
+            kvp("$set", make_document(kvp(
+                "updatedAt", bsoncxx::types::b_date{std::chrono::system_clock::now()})))),
+        opts);
+    if (!updated) {
+      callback(msgOk("Already reported"));
+      return;
+    }
+
+    Json::Value whisper = pulse::bsonjson::toJson(updated->view());
+    if (whisper.get("reports", 0).asInt64() >= 5) {
+      col.update_one(make_document(kvp("_id", *whisperOid)),
+                     make_document(kvp("$set", make_document(kvp("isHidden", true)))));
+    }
 
     // res.json({ success: true, message: 'Reported' });
     callback(msgOk("Reported"));

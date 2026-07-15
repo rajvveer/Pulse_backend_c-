@@ -21,11 +21,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <chrono>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
+#include <iomanip>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -96,6 +100,56 @@ std::string isoFromMillis(long long millis) {
   return std::string(buf);
 }
 
+std::optional<bsoncxx::types::b_date> dateFromIso(const Json::Value& value) {
+  if (!value.isString()) return std::nullopt;
+  const std::string iso = value.asString();
+  if ((iso.size() != 20 && iso.size() != 24) || iso.back() != 'Z')
+    return std::nullopt;
+
+  std::tm tm{};
+  std::istringstream stream(iso.substr(0, 19));
+  stream >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+  if (stream.fail()) return std::nullopt;
+#if defined(_WIN32)
+  const std::time_t seconds = _mkgmtime(&tm);
+#else
+  const std::time_t seconds = timegm(&tm);
+#endif
+  int millis = 0;
+  if (iso.size() == 24) {
+    if (iso[19] != '.' || !std::isdigit(static_cast<unsigned char>(iso[20])) ||
+        !std::isdigit(static_cast<unsigned char>(iso[21])) ||
+        !std::isdigit(static_cast<unsigned char>(iso[22])))
+      return std::nullopt;
+    millis = (iso[20] - '0') * 100 + (iso[21] - '0') * 10 + (iso[22] - '0');
+  }
+  return bsoncxx::types::b_date{std::chrono::milliseconds{
+      static_cast<long long>(seconds) * 1000 + millis}};
+}
+
+bsoncxx::array::value snapshotsToBson(const Json::Value& snapshots) {
+  bld::array output;
+  if (!snapshots.isArray()) return output.extract();
+
+  for (const Json::Value& snapshot : snapshots) {
+    if (!snapshot.isObject()) continue;
+    Json::Value nonDates = snapshot;
+    nonDates.removeMember("weekStart");
+    nonDates.removeMember("weekEnd");
+    const auto base = pulse::bsonjson::fromJson(nonDates);
+    bld::document item;
+    for (const auto& element : base.view())
+      item.append(kvp(element.key(), element.get_value()));
+    const auto fallback = bsoncxx::types::b_date{std::chrono::system_clock::now()};
+    item.append(kvp("weekStart",
+                    dateFromIso(snapshot["weekStart"]).value_or(fallback)));
+    item.append(kvp("weekEnd",
+                    dateFromIso(snapshot["weekEnd"]).value_or(fallback)));
+    output.append(item.extract());
+  }
+  return output.extract();
+}
+
 // Build the BSON insert document for a brand-new DNA profile from a Json doc
 // that has already had applyDefaults() run on it. `user` is stored as a real
 // BSON ObjectId; the rest are simple scalars / empty arrays.
@@ -127,9 +181,10 @@ bsoncxx::document::value buildInsertDoc(const Json::Value& doc,
   out.append(kvp("streak", static_cast<int>(numOr(doc, "streak", 0))));
   out.append(kvp("totalWeeksTracked", static_cast<int>(numOr(doc, "totalWeeksTracked", 0))));
   out.append(kvp("cardShareCount", static_cast<int>(numOr(doc, "cardShareCount", 0))));
-  out.append(kvp("lastComputedAt", doc["lastComputedAt"].asString()));
-  out.append(kvp("createdAt", doc["createdAt"].asString()));
-  out.append(kvp("updatedAt", doc["updatedAt"].asString()));
+  const auto now = bsoncxx::types::b_date{std::chrono::system_clock::now()};
+  out.append(kvp("lastComputedAt", now));
+  out.append(kvp("createdAt", now));
+  out.append(kvp("updatedAt", now));
   out.append(kvp("__v", 0));
   return out.extract();
 }
@@ -507,21 +562,29 @@ std::optional<Json::Value> recordSignal(const std::string& userId,
     for (const auto& v : kVibeList) {
       if (v == vibe) { valid = true; break; }
     }
-    if (!valid) return std::nullopt;
+    if (!valid || weight <= 0 || weight > 1000) return std::nullopt;
 
     auto col = pulse::db::collection(kCollection);
     const bsoncxx::oid userOid = oid(userId);
 
     // const dna = await this.getOrCreate(userId);
-    Json::Value dna = getOrCreate(userId);
+    (void)getOrCreate(userId);
 
-    // dna.rawSignals[vibe] += weight; dna.totalSignals += weight;
-    if (!dna.isMember("rawSignals") || !dna["rawSignals"].isObject())
-      dna["rawSignals"] = Json::Value(Json::objectValue);
-    int newRaw = static_cast<int>(numOr(dna["rawSignals"], vibe, 0)) + weight;
-    dna["rawSignals"][vibe] = newRaw;
-    int newTotal = static_cast<int>(numOr(dna, "totalSignals", 0)) + weight;
-    dna["totalSignals"] = newTotal;
+    // Record the signal with an atomic increment so concurrent actions cannot
+    // overwrite one another before percentages are recomputed.
+    mongocxx::options::find_one_and_update incrementOpts{};
+    incrementOpts.return_document(mongocxx::options::return_document::k_after);
+    auto incremented = col.find_one_and_update(
+        make_document(kvp("user", userOid)),
+        make_document(kvp("$inc", make_document(
+            kvp("rawSignals." + vibe, weight), kvp("totalSignals", weight)))),
+        incrementOpts);
+    if (!incremented) return std::nullopt;
+    Json::Value dna = pulse::bsonjson::toJson(incremented->view());
+
+    for (int retry = 0; retry < 8; ++retry) {
+    const long long expectedTotal =
+        static_cast<long long>(numOr(dna, "totalSignals", 0));
 
     // dna._recalcStrands();
     recalcStrands(dna);
@@ -529,27 +592,31 @@ std::optional<Json::Value> recordSignal(const std::string& userId,
     // dna.lastComputedAt = new Date();
     const std::string now = nowIso8601();
     dna["lastComputedAt"] = now;
+    const auto nowDate = bsoncxx::types::b_date{std::chrono::system_clock::now()};
 
     // await dna.save(); — persist the mutated fields.
     bld::document setDoc;
-    setDoc.append(kvp("rawSignals." + vibe, newRaw));
-    setDoc.append(kvp("totalSignals", newTotal));
     for (const auto& v : kVibeList) {
       setDoc.append(kvp("strands." + v, dna["strands"][v].asInt()));
     }
     setDoc.append(kvp("dominantVibe", dna["dominantVibe"].asString()));
-    setDoc.append(kvp("lastComputedAt", now));
-    setDoc.append(kvp("updatedAt", now));
+    setDoc.append(kvp("lastComputedAt", nowDate));
+    setDoc.append(kvp("updatedAt", nowDate));
 
     mongocxx::options::find_one_and_update opts{};
     opts.return_document(mongocxx::options::return_document::k_after);
 
     auto updated = col.find_one_and_update(
-        make_document(kvp("user", userOid)),
+        make_document(kvp("user", userOid),
+                      kvp("totalSignals", expectedTotal)),
         make_document(kvp("$set", setDoc.extract())),
         opts);
 
     if (updated) return pulse::bsonjson::toJson(updated->view());
+    auto latest = col.find_one(make_document(kvp("user", userOid)));
+    if (!latest) return std::nullopt;
+    dna = pulse::bsonjson::toJson(latest->view());
+    }
     return dna;
   } catch (const std::exception& e) {
     pulse::log::error("SocialDNA recordSignal failed: {}", e.what());
@@ -596,14 +663,24 @@ long long runWeeklyComputation() {
 
           // Persist the mutated snapshots / latestInsights / streak / weeks.
           // Build a $set whose value is a JSON object, converted to BSON once.
-          Json::Value setJson(Json::objectValue);
-          setJson["snapshots"]         = dna["snapshots"];
-          setJson["latestInsights"]    = dna["latestInsights"];
-          if (dna.isMember("streak"))            setJson["streak"] = dna["streak"];
-          if (dna.isMember("totalWeeksTracked")) setJson["totalWeeksTracked"] = dna["totalWeeksTracked"];
+          Json::Value insightWrapper(Json::objectValue);
+          insightWrapper["latestInsights"] = dna["latestInsights"];
+          const auto generic = pulse::bsonjson::fromJson(insightWrapper);
+
+          bld::document setDoc;
+          setDoc.append(kvp("snapshots", snapshotsToBson(dna["snapshots"])));
+          setDoc.append(kvp("latestInsights",
+                            generic.view()["latestInsights"].get_value()));
+          if (dna.isMember("streak"))
+            setDoc.append(kvp("streak", dna["streak"].asInt()));
+          if (dna.isMember("totalWeeksTracked"))
+            setDoc.append(kvp("totalWeeksTracked",
+                              dna["totalWeeksTracked"].asInt()));
+          setDoc.append(kvp("updatedAt", bsoncxx::types::b_date{
+                                             std::chrono::system_clock::now()}));
 
           col.update_one(make_document(kvp("_id", batchLast)),
-                         make_document(kvp("$set", pulse::bsonjson::fromJson(setJson))));
+                         make_document(kvp("$set", setDoc.extract())));
           ++processed;
         } catch (const std::exception& e) {
           // Promise.allSettled semantics — one failure doesn't abort the batch.

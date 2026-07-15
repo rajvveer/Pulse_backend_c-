@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <ctime>
+#include <exception>
 
 namespace pulse::models::userbehavior {
 
@@ -235,27 +236,40 @@ std::optional<Json::Value> findByUser(const std::string& userId) {
 
 // ── Index management ────────────────────────────────────────────────────────
 void ensureIndexes() {
-  try {
-    auto col = pulse::db::collection(kCollection);
+  auto col = pulse::db::collection(kCollection);
+  std::exception_ptr firstFailure;
 
-    // Field-level: user: { unique: true, index: true } -> unique index { user: 1 }.
-    {
-      mongocxx::options::index opts{};
-      opts.unique(true);
-      col.create_index(make_document(kvp("user", 1)), opts);
+  // Attempt every independent index even when an earlier one fails. This keeps
+  // a legacy user-index conflict from suppressing the activity index, while
+  // still propagating the failure so the central index runner cannot report a
+  // false success.
+  auto attempt = [&](const char* name, auto&& create) {
+    try {
+      create();
+    } catch (const std::exception& e) {
+      pulse::log::error("UserBehavior index '{}' failed: {}", name, e.what());
+      if (!firstFailure) firstFailure = std::current_exception();
+    } catch (...) {
+      pulse::log::error("UserBehavior index '{}' failed: unknown error", name);
+      if (!firstFailure) firstFailure = std::current_exception();
     }
+  };
 
-    // userBehaviorSchema.index({ user: 1 })  (duplicate of the field-level index;
-    // mongocxx treats it as a no-op against the existing { user: 1 } index).
-    col.create_index(make_document(kvp("user", 1)));
+  // Field-level user: { unique: true, index: true }. Do not also create the
+  // schema's redundant non-unique {user:1}: Mongo treats that as a conflicting
+  // specification when the unique index already exists.
+  attempt("unique_user", [&] {
+    mongocxx::options::index opts{};
+    opts.unique(true);
+    col.create_index(make_document(kvp("user", 1)), opts);
+  });
 
-    // userBehaviorSchema.index({ 'currentSession.lastActivityAt': 1 })
+  attempt("current_session_activity", [&] {
     col.create_index(make_document(kvp("currentSession.lastActivityAt", 1)));
+  });
 
-    pulse::log::info("UserBehavior indexes ensured ({})", kCollection);
-  } catch (const std::exception& e) {
-    pulse::log::error("UserBehavior ensureIndexes failed: {}", e.what());
-  }
+  if (firstFailure) std::rethrow_exception(firstFailure);
+  pulse::log::info("UserBehavior indexes ensured ({})", kCollection);
 }
 
 // ── Insert defaults + output sanitization ───────────────────────────────────

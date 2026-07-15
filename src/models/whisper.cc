@@ -27,6 +27,7 @@
 #include <chrono>
 #include <ctime>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 
 namespace pulse::models::whisper {
@@ -173,6 +174,7 @@ Json::Value sanitizeForOutput(Json::Value doc) {
   // Anonymous model: strip the select:false / sensitive fields the schema hides.
   // author (top-level, never exposed).
   doc.removeMember("author");
+  doc.removeMember("reportedBy");
 
   // voters[].user (select:false on the voter subdoc's user).
   if (doc.isMember("voters") && doc["voters"].isArray()) {
@@ -212,7 +214,8 @@ Json::Value getNearby(double lng, double lat, double radiusKm, int limit) {
                   kvp("type", "Point"),
                   kvp("coordinates", make_array(lng, lat)))),
               kvp("$maxDistance", radiusKm * 1000))))),
-      kvp("isHidden", false));
+      kvp("isHidden", false),
+      kvp("expiresAt", make_document(kvp("$gt", nowDate()))));
 
   // .sort({ score: -1, createdAt: -1 }).limit(limit)
   //   .select('-author -voters.user -replies.author')
@@ -221,6 +224,7 @@ Json::Value getNearby(double lng, double lat, double radiusKm, int limit) {
   opts.limit(limit);
   opts.projection(make_document(
       kvp("author", 0),
+      kvp("reportedBy", 0),
       kvp("voters.user", 0),
       kvp("replies.author", 0)));
 
@@ -240,12 +244,19 @@ std::optional<VoteResult> vote(const std::string& whisperId,
   auto whisperOid = tryOid(whisperId);
   if (!whisperOid) return std::nullopt;  // invalid id -> no such whisper
 
+  for (int retry = 0; retry < 8; ++retry) {
+
   // findById(whisperId).select('+voters.user') — voters.user is select:false so
   // it must be explicitly included; the rest of the doc loads by default.
-  auto found = col.find_one(make_document(kvp("_id", *whisperOid)));
+  auto found = col.find_one(make_document(
+      kvp("_id", *whisperOid),
+      kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+      kvp("isHidden", make_document(kvp("$ne", true)))));
   if (!found) return std::nullopt;       // JS: throw new Error('Whisper not found')
 
   Json::Value whisper = pulse::bsonjson::toJson(found->view());
+  const bool hasVersion = whisper.isMember("__v") && whisper["__v"].isIntegral();
+  const long long version = hasVersion ? whisper["__v"].asInt64() : 0;
 
   long long upvotes   = whisper.isMember("upvotes")   ? whisper["upvotes"].asInt64()   : 0;
   long long downvotes = whisper.isMember("downvotes") ? whisper["downvotes"].asInt64() : 0;
@@ -295,6 +306,15 @@ std::optional<VoteResult> vote(const std::string& whisperId,
     if (voteType == "up") ++upvotes; else ++downvotes;
   }
 
+  // Derive tallies from the authoritative voter set so legacy drift or a
+  // previously interrupted update cannot create negative/inconsistent counts.
+  upvotes = 0;
+  downvotes = 0;
+  for (const Json::Value& voter : voters) {
+    const std::string storedVote = voter.get("vote", "").asString();
+    if (storedVote == "up") ++upvotes;
+    else if (storedVote == "down") ++downvotes;
+  }
   const long long score = upvotes - downvotes;
 
   // Rebuild the voters BSON array, preserving each voter's user ObjectId.
@@ -311,20 +331,35 @@ std::optional<VoteResult> vote(const std::string& whisperId,
   }
 
   // whisper.save() — persist updated voters, tallies, score, and updatedAt.
-  auto update = make_document(kvp("$set", make_document(
-      kvp("voters", votersArr.extract()),
-      kvp("upvotes", upvotes),
-      kvp("downvotes", downvotes),
-      kvp("score", score),
-      kvp("updatedAt", nowDate()))));
+  auto update = make_document(
+      kvp("$set", make_document(
+          kvp("voters", votersArr.extract()),
+          kvp("upvotes", upvotes),
+          kvp("downvotes", downvotes),
+          kvp("score", score),
+          kvp("updatedAt", nowDate()))),
+      kvp("$inc", make_document(kvp("__v", 1))));
 
-  col.update_one(make_document(kvp("_id", *whisperOid)), update.view());
+  bld::document casFilter;
+  casFilter.append(kvp("_id", *whisperOid),
+                   kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+                   kvp("isHidden", make_document(kvp("$ne", true))));
+  if (hasVersion)
+    casFilter.append(kvp("__v", version));
+  else
+    casFilter.append(kvp("__v", make_document(kvp("$exists", false))));
+
+  auto updateResult = col.update_one(casFilter.view(), update.view());
+  if (!updateResult || updateResult->matched_count() == 0) continue;
 
   VoteResult result;
   result.upvotes = upvotes;
   result.downvotes = downvotes;
   result.score = score;
   return result;
+  }
+
+  throw std::runtime_error("Whisper vote conflicted; please retry");
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +394,12 @@ std::optional<Json::Value> addReply(const std::string& whisperId,
       kvp("$push", make_document(kvp("replies", reply.extract()))),
       kvp("$set", make_document(kvp("updatedAt", nowDate()))));
 
-  auto result = col.update_one(make_document(kvp("_id", *whisperOid)), update.view());
+  auto result = col.update_one(
+      make_document(
+          kvp("_id", *whisperOid),
+          kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+          kvp("isHidden", make_document(kvp("$ne", true)))),
+      update.view());
   if (!result || result->matched_count() == 0) return std::nullopt;
 
   // Return the freshly appended reply (this.replies[this.replies.length - 1]),

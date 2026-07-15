@@ -15,6 +15,7 @@
 #include "pulse/controllers/alter_ego_controller.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <exception>
@@ -25,6 +26,7 @@
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/oid.hpp>
+#include <bsoncxx/types.hpp>
 #include <mongocxx/collection.hpp>
 
 #include "pulse/bson_json.hpp"
@@ -310,7 +312,8 @@ void AlterEgoController::update(
 
     // await ego.save();  (timestamps:true bumps updatedAt on any save)
     const std::string nowIso = pulse::bsonjson::nowIso8601();
-    setDoc.append(kvp("updatedAt", nowIso));
+    setDoc.append(kvp("updatedAt", bsoncxx::types::b_date{
+                                       std::chrono::system_clock::now()}));
     ego["updatedAt"] = nowIso;
     (void)changed;
 
@@ -472,7 +475,8 @@ void AlterEgoController::toggle(
     col.update_one(
         make_document(kvp("_id", pulse::bsonjson::oid(egoId))),
         make_document(kvp("$set", make_document(kvp("isActive", newActive),
-                                                kvp("updatedAt", nowIso)))));
+                                                kvp("updatedAt", bsoncxx::types::b_date{
+                                                    std::chrono::system_clock::now()})))));
 
     // res.json({ success: true, data: { isActive: ego.isActive } });
     Json::Value data(Json::objectValue);
