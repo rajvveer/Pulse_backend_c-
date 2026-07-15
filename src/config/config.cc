@@ -2,11 +2,14 @@
 #include "pulse/config.hpp"
 
 #include <cstdlib>
+#include <charconv>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <unordered_map>
 #include <algorithm>
+#include <system_error>
 
 namespace pulse {
 
@@ -31,6 +34,20 @@ std::vector<std::string> split(const std::string& s, char delim) {
   while (std::getline(ss, item, delim)) out.push_back(trim(item));
   return out;
 }
+
+bool looksLikePlaceholderSecret(const std::string& value) {
+  std::string normalized = trim(value);
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  static constexpr const char* kPrefixes[] = {
+      "change_me", "changeme", "replace_me", "replace-me", "your_",
+      "your-", "example", "placeholder", "dev-only", "default-", "test-"};
+  for (const char* prefix : kPrefixes) {
+    if (normalized.rfind(prefix, 0) == 0) return true;
+  }
+  return normalized == "secret" || normalized == "password" ||
+         normalized == "jwt_secret" || normalized == "session_secret";
+}
 } // namespace
 
 std::string Config::env(const std::string& key, const std::string& def) const {
@@ -41,9 +58,14 @@ std::string Config::env(const std::string& key, const std::string& def) const {
 }
 
 int64_t Config::envInt(const std::string& key, int64_t def) const {
-  std::string v = env(key);
+  const std::string v = env(key);
   if (v.empty()) return def;
-  try { return std::stoll(v); } catch (...) { return def; }
+  int64_t value = 0;
+  const char* first = v.data();
+  const char* last = first + v.size();
+  const auto parsed = std::from_chars(first, last, value, 10);
+  if (parsed.ec != std::errc{} || parsed.ptr != last) return def;
+  return value;
 }
 
 bool Config::envBool(const std::string& key, bool def) const {
@@ -94,10 +116,36 @@ void Config::validateRequired() {
     std::cerr << "\xE2\x9D\x8C REDIS_URL or REDIS_HOST must be set in production\n";
     std::exit(1);
   }
+
+  if (isProduction()) {
+    // These values authenticate sessions or sign bearer credentials. A short
+    // value (or a deployment-template placeholder) is equivalent to shipping a
+    // known key, so refuse to boot instead of silently weakening production.
+    const std::vector<std::string> strongSecrets = {
+        "JWT_SECRET", "JWT_REFRESH_SECRET", "TEMP_JWT_SECRET", "SESSION_SECRET"};
+    std::vector<std::string> weak;
+    for (const auto& key : strongSecrets) {
+      const std::string value = env(key);
+      if (!value.empty() && (value.size() < 32 || looksLikePlaceholderSecret(value))) {
+        weak.push_back(key);
+      }
+    }
+    for (const char* key : {"INTERNAL_STATUS_KEY", "ADMIN_SETUP_TOKEN"}) {
+      const std::string value = env(key);
+      if (!value.empty() && (value.size() < 32 || looksLikePlaceholderSecret(value))) {
+        weak.emplace_back(key);
+      }
+    }
+    if (!weak.empty()) {
+      std::cerr << "\xE2\x9D\x8C Production secrets must be at least 32 characters and not placeholders:\n";
+      for (const auto& key : weak) std::cerr << "   - " << key << "\n";
+      std::exit(1);
+    }
+  }
 }
 
 void Config::build() {
-  server.port        = (int)envInt("PORT", 3000);
+  server.port        = static_cast<int>(std::clamp<int64_t>(envInt("PORT", 3000), 1, 65535));
   server.nodeEnv     = nodeEnv_;
   server.apiVersion  = env("API_VERSION", "v1");
   server.serverUrl   = env("SERVER_URL", "http://localhost:3000");
@@ -105,9 +153,12 @@ void Config::build() {
 
   database.mongoUri     = env("MONGO_URI", "mongodb://localhost:27017/pulse");
   database.mongoTestUri = env("MONGO_TEST_URI", "mongodb://localhost:27017/pulse_test");
-  database.maxPoolSize  = (int)envInt("MONGO_OPTIONS_MAX_POOL_SIZE", 50);
-  database.minPoolSize  = (int)envInt("MONGO_OPTIONS_MIN_POOL_SIZE", 5);
-  database.serverSelectionTimeoutMs = (int)envInt("MONGO_OPTIONS_SERVER_SELECTION_TIMEOUT_MS", 5000);
+  database.maxPoolSize  = static_cast<int>(std::clamp<int64_t>(
+      envInt("MONGO_OPTIONS_MAX_POOL_SIZE", 50), 1, 1000));
+  database.minPoolSize  = static_cast<int>(std::clamp<int64_t>(
+      envInt("MONGO_OPTIONS_MIN_POOL_SIZE", 5), 0, database.maxPoolSize));
+  database.serverSelectionTimeoutMs = static_cast<int>(std::clamp<int64_t>(
+      envInt("MONGO_OPTIONS_SERVER_SELECTION_TIMEOUT_MS", 5000), 100, 300000));
 
   jwt.secret           = env("JWT_SECRET");
   jwt.refreshSecret    = env("JWT_REFRESH_SECRET");
@@ -115,18 +166,24 @@ void Config::build() {
   jwt.expiresIn        = env("JWT_EXPIRES_IN", "15m");
   jwt.refreshExpiresIn = env("JWT_REFRESH_EXPIRES_IN", "7d");
 
-  security.bcryptSaltRounds = (int)envInt("BCRYPT_SALT_ROUNDS", 12);
+  security.bcryptSaltRounds = static_cast<int>(std::clamp<int64_t>(
+      envInt("BCRYPT_SALT_ROUNDS", 12), 4, 16));
   security.sessionSecret    = env("SESSION_SECRET", "dev-only-session-secret");
 
   redis.url        = env("REDIS_URL");
   redis.host       = env("REDIS_HOST", "localhost");
-  redis.port       = (int)envInt("REDIS_PORT", 6379);
+  redis.port       = static_cast<int>(std::clamp<int64_t>(
+      envInt("REDIS_PORT", 6379), 1, 65535));
   redis.password   = env("REDIS_PASSWORD");
-  redis.maxRetries = (int)envInt("REDIS_MAX_RETRIES", 3);
+  redis.maxRetries = static_cast<int>(std::clamp<int64_t>(
+      envInt("REDIS_MAX_RETRIES", 3), 0, 100));
 
-  rateLimit.windowMs         = envInt("RATE_LIMIT_WINDOW_MS", 900000);
-  rateLimit.maxRequests      = (int)envInt("RATE_LIMIT_MAX_REQUESTS", 100);
-  rateLimit.maxRequestsPerIp = (int)envInt("RATE_LIMIT_MAX_REQUESTS_PER_IP", 1000);
+  rateLimit.windowMs = std::clamp<int64_t>(
+      envInt("RATE_LIMIT_WINDOW_MS", 900000), 1000, 24LL * 60 * 60 * 1000);
+  rateLimit.maxRequests = static_cast<int>(std::clamp<int64_t>(
+      envInt("RATE_LIMIT_MAX_REQUESTS", 100), 1, 1000000));
+  rateLimit.maxRequestsPerIp = static_cast<int>(std::clamp<int64_t>(
+      envInt("RATE_LIMIT_MAX_REQUESTS_PER_IP", 1000), 1, 1000000));
 
   std::string co = env("CORS_ORIGIN");
   cors.origin = co.empty() ? std::vector<std::string>{"http://localhost:3000"} : split(co, ',');
