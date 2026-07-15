@@ -10,10 +10,27 @@
 // controllers read it with req->getAttributes()->get<Json::Value>("user").
 #pragma once
 #include <drogon/HttpFilter.h>
+#include "pulse/jwt_service.hpp"
+
+#include <string>
 
 namespace pulse::filters {
 
 using namespace drogon;
+
+// Shared by REST filters and WebSocket handshakes/message revalidation so all
+// transports enforce the same JWT, revocation, and active-account policy.
+enum class AccessTokenStatus {
+  Valid,
+  Expired,
+  Invalid,
+  Revoked,
+  Inactive,
+  SessionInactive
+};
+
+AccessTokenStatus validateAccessToken(const std::string& token,
+                                      pulse::AccessClaims& claims);
 
 class AuthFilter : public HttpFilter<AuthFilter> {
 public:

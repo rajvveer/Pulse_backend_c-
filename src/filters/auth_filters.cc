@@ -9,9 +9,11 @@
 
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
+#include <bsoncxx/types.hpp>
 #include <openssl/sha.h>
 #include <iomanip>
 #include <sstream>
+#include <chrono>
 
 // The HTTP status-code constants (k401Unauthorized, k403Forbidden, …) live in
 // the drogon namespace; bring them in so the handlers can use them unqualified.
@@ -62,6 +64,29 @@ bool resolveUserActive(const std::string& userId) {
   return val == "true";
 }
 
+bool hasActiveSession(const std::string& userId, const std::string& token) {
+  try {
+    auto oid = pulse::bsonjson::tryOid(userId);
+    if (!oid) return false;
+    auto sessions = pulse::db::collection("sessions");
+    const auto now = bsoncxx::types::b_date{
+        std::chrono::system_clock::now()};
+    auto session = sessions.find_one(
+        bsoncxx::builder::basic::make_document(
+            bsoncxx::builder::basic::kvp("userId", *oid),
+            bsoncxx::builder::basic::kvp("accessToken", sha256Hex(token)),
+            bsoncxx::builder::basic::kvp("isActive", true),
+            bsoncxx::builder::basic::kvp(
+                "expiresAt", bsoncxx::builder::basic::make_document(
+                                 bsoncxx::builder::basic::kvp("$gt", now)))));
+    return session.has_value();
+  } catch (...) {
+    // Authentication state is security-sensitive: fail closed when Mongo is
+    // unavailable instead of accepting a token whose session cannot be proven.
+    return false;
+  }
+}
+
 void setUser(const HttpRequestPtr& req, const std::string& userId, const std::string& username,
              const std::string& email, bool isVerified) {
   Json::Value u(Json::objectValue);
@@ -73,6 +98,30 @@ void setUser(const HttpRequestPtr& req, const std::string& userId, const std::st
 }
 } // namespace
 
+AccessTokenStatus validateAccessToken(const std::string& token,
+                                      pulse::AccessClaims& claims) {
+  try {
+    claims = pulse::jwt().verifyAccessToken(token);
+    try {
+      auto rev = pulse::cache().get("revoked_token:" + sha256Hex(token));
+      if (rev && !rev->empty()) return AccessTokenStatus::Revoked;
+    } catch (...) {
+      // Redis is required in production; preserve local development fallback.
+    }
+    if (!resolveUserActive(claims.userId)) return AccessTokenStatus::Inactive;
+    if (!hasActiveSession(claims.userId, token))
+      return AccessTokenStatus::SessionInactive;
+    return AccessTokenStatus::Valid;
+  } catch (const pulse::JwtError& e) {
+    const std::string message = e.what();
+    return message.find("expired") != std::string::npos
+               ? AccessTokenStatus::Expired
+               : AccessTokenStatus::Invalid;
+  } catch (...) {
+    return AccessTokenStatus::Invalid;
+  }
+}
+
 void AuthFilter::doFilter(const HttpRequestPtr& req, FilterCallback&& fcb, FilterChainCallback&& fccb) {
   std::string h = req->getHeader("authorization");
   if (h.rfind("Bearer ", 0) != 0) {
@@ -80,44 +129,42 @@ void AuthFilter::doFilter(const HttpRequestPtr& req, FilterCallback&& fcb, Filte
   }
   std::string token = h.substr(7);
 
-  try {
-    auto claims = pulse::jwt().verifyAccessToken(token);
-
-    // Revoked-token denylist (best-effort; fail open if Redis is down).
-    try {
-      auto rev = pulse::cache().get("revoked_token:" + sha256Hex(token));
-      if (rev && !rev->empty()) {
-        return fcb(pulse::http::error(k401Unauthorized, "Access token revoked", "TOKEN_REVOKED"));
-      }
-    } catch (...) {}
-
-    if (!resolveUserActive(claims.userId)) {
-      return fcb(pulse::http::error(k401Unauthorized, "User not found or inactive", "USER_NOT_FOUND"));
-    }
-
-    setUser(req, claims.userId, claims.username, claims.email, claims.isVerified);
-    return fccb();
-  } catch (const pulse::JwtError& e) {
-    std::string m = e.what();
-    if (m.find("expired") != std::string::npos)
-      return fcb(pulse::http::error(k401Unauthorized, "Access token expired", "TOKEN_EXPIRED"));
-    if (m.find("Invalid") != std::string::npos)
-      return fcb(pulse::http::error(k401Unauthorized, "Invalid access token", "INVALID_TOKEN"));
-    return fcb(pulse::http::error(k401Unauthorized, "Authentication failed", "AUTH_FAILED"));
-  } catch (...) {
-    return fcb(pulse::http::error(k401Unauthorized, "Authentication failed", "AUTH_FAILED"));
+  pulse::AccessClaims claims;
+  switch (validateAccessToken(token, claims)) {
+    case AccessTokenStatus::Valid:
+      setUser(req, claims.userId, claims.username, claims.email,
+              claims.isVerified);
+      return fccb();
+    case AccessTokenStatus::Expired:
+      return fcb(pulse::http::error(k401Unauthorized, "Access token expired",
+                                    "TOKEN_EXPIRED"));
+    case AccessTokenStatus::Revoked:
+      return fcb(pulse::http::error(k401Unauthorized, "Access token revoked",
+                                    "TOKEN_REVOKED"));
+    case AccessTokenStatus::Inactive:
+      return fcb(pulse::http::error(k401Unauthorized,
+                                    "User not found or inactive",
+                                    "USER_NOT_FOUND"));
+    case AccessTokenStatus::SessionInactive:
+      return fcb(pulse::http::error(k401Unauthorized,
+                                    "Session is no longer active",
+                                    "SESSION_INACTIVE"));
+    case AccessTokenStatus::Invalid:
+      return fcb(pulse::http::error(k401Unauthorized, "Invalid access token",
+                                    "INVALID_TOKEN"));
   }
+  return fcb(pulse::http::error(k401Unauthorized, "Authentication failed",
+                                "AUTH_FAILED"));
 }
 
 void OptionalAuthFilter::doFilter(const HttpRequestPtr& req, FilterCallback&& fcb, FilterChainCallback&& fccb) {
   std::string token = bearerToken(req);
   if (token.empty()) return fccb();
-  try {
-    auto claims = pulse::jwt().verifyAccessToken(token);
-    if (resolveUserActive(claims.userId)) {
-      setUser(req, claims.userId, claims.username, claims.email, claims.isVerified);
-    }
-  } catch (...) { /* silent — optional */ }
+  pulse::AccessClaims claims;
+  if (validateAccessToken(token, claims) == AccessTokenStatus::Valid) {
+    setUser(req, claims.userId, claims.username, claims.email,
+            claims.isVerified);
+  }
   return fccb();
 }
 
