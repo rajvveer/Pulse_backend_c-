@@ -20,6 +20,13 @@
 #include <string>
 #include <random>
 #include <chrono>
+#include <atomic>
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <unordered_set>
 
 // Defined in src/controllers/post_controller.cc — the trending-hashtags
 // aggregation, returning the compact JSON string to cache.
@@ -46,6 +53,10 @@ bool acquireLock(const std::string& name, long long intervalMs, long long lockTt
   try {
     long long ttl = std::max(intervalMs / 1000 - 60, lockTtlSec);
     auto redis = pulse::cache().raw();
+    if (!redis) {
+      pulse::log::warn("[jobs] Redis unavailable; skipping {} tick", name);
+      return false;
+    }
     using namespace sw::redis;
     std::string value = std::to_string(pulse::bsonjson::nowMillis()); // String(Date.now())
     auto ok = redis->set("job_lock:" + name, value,
@@ -90,12 +101,52 @@ std::vector<Job> buildJobs() {
   };
 }
 
-bool g_started = false;
+std::atomic<bool> g_started{false};
+std::mutex g_queueMu;
+std::condition_variable g_queueCv;
+std::deque<Job> g_queue;
+std::unordered_set<std::string> g_pending;
+std::vector<std::thread> g_workers;
+
+void workerLoop() {
+  for (;;) {
+    Job job;
+    {
+      std::unique_lock<std::mutex> lock(g_queueMu);
+      g_queueCv.wait(lock, [] { return !g_started.load() || !g_queue.empty(); });
+      if (!g_started.load() && g_queue.empty()) return;
+      job = std::move(g_queue.front());
+      g_queue.pop_front();
+    }
+
+    runJob(job);
+
+    std::lock_guard<std::mutex> lock(g_queueMu);
+    g_pending.erase(job.name);
+  }
+}
+
+void enqueueJob(const Job& job) {
+  if (!g_started.load()) return;
+  {
+    std::lock_guard<std::mutex> lock(g_queueMu);
+    if (!g_started.load() || !g_pending.insert(job.name).second) return;
+    g_queue.push_back(job);
+  }
+  g_queueCv.notify_one();
+}
 } // namespace
 
 void start() {
-  if (g_started) return;
-  g_started = true;
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true)) return;
+
+  const int workerCount = static_cast<int>(std::max<int64_t>(
+      1, std::min<int64_t>(8,
+          pulse::config().envInt("BACKGROUND_JOB_WORKERS", 2))));
+  g_workers.reserve(static_cast<size_t>(workerCount));
+  for (int i = 0; i < workerCount; ++i) g_workers.emplace_back(workerLoop);
+
   auto jobs = std::make_shared<std::vector<Job>>(buildJobs());
   auto loop = drogon::app().getLoop();
   static thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -106,12 +157,29 @@ void start() {
     std::uniform_int_distribution<long long> d(0, 4 * 60 * 1000);
     double initialDelaySec = (60'000 + d(rng)) / 1000.0;
     double intervalSec = job.intervalMs / 1000.0;
-    loop->runAfter(initialDelaySec, [jobs, i]{ runJob((*jobs)[i]); });
-    loop->runEvery(intervalSec, [jobs, i]{ runJob((*jobs)[i]); });
+    loop->runAfter(initialDelaySec, [jobs, i]{ enqueueJob((*jobs)[i]); });
+    loop->runEvery(intervalSec, [jobs, i]{ enqueueJob((*jobs)[i]); });
   }
-  pulse::log::info("[jobs] Scheduler started with {} jobs", jobs->size());
+  pulse::log::info("[jobs] Scheduler started with {} jobs and {} workers",
+                   jobs->size(), workerCount);
 }
 
-void stop() { g_started = false; }
+void requestStop() {
+  if (!g_started.exchange(false)) return;
+  {
+    std::lock_guard<std::mutex> lock(g_queueMu);
+    g_queue.clear();
+    g_pending.clear();
+  }
+  g_queueCv.notify_all();
+}
+
+void stop() {
+  requestStop();
+  for (auto& worker : g_workers) {
+    if (worker.joinable()) worker.join();
+  }
+  g_workers.clear();
+}
 
 } // namespace pulse::jobs

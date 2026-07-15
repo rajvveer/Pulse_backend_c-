@@ -21,8 +21,14 @@
 #include "pulse/http_response.hpp"
 #include "pulse/scheduler.hpp"
 #include "pulse/filters/upload_filters.hpp"
+#include "pulse/filters/rate_limit_filters.hpp"
+#include "pulse/filters/sanitize_filter.hpp"
+#include "pulse/services/firebase_service.hpp"
+#include "pulse/sockets/realtime_controller.hpp"
+#include "pulse/sockets/presence_socket.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <thread>
@@ -32,11 +38,12 @@ using namespace pulse;
 
 namespace {
 std::atomic<bool> g_shuttingDown{false};
+volatile std::sig_atomic_t g_pendingSignal = 0;
 std::chrono::steady_clock::time_point g_startTime;
 
 // Optional external hooks (defined in their own units; weak fallbacks here so
 // the binary links even before those units are added).
-void initFirebaseIfPresent();
+bool initFirebaseIfPresent();
 void initSmtpIfPresent();
 void startBackgroundJobsIfEnabled();
 
@@ -56,13 +63,29 @@ void applyCorsHeaders(const HttpRequestPtr& req, const HttpResponsePtr& resp) {
   for (const auto& o : allowedOrigins()) {
     if (o == origin) {
       resp->addHeader("Access-Control-Allow-Origin", origin);
-      resp->addHeader("Access-Control-Allow-Credentials", "true");
+      if (config().cors.credentials)
+        resp->addHeader("Access-Control-Allow-Credentials", "true");
       resp->addHeader("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
       resp->addHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Origin");
       return;
     }
   }
   log::warn("CORS blocked request from origin: {}", origin);
+}
+
+void scrubProductionServerError(const HttpResponsePtr& resp) {
+  if (!config().isProduction() ||
+      resp->getStatusCode() != k500InternalServerError) {
+    return;
+  }
+  Json::Value body(Json::objectValue);
+  body["success"] = false;
+  body["error"] = "An unexpected internal server error occurred.";
+  body["code"] = "INTERNAL_ERROR";
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  resp->setContentTypeString("application/json; charset=utf-8");
+  resp->setBody(Json::writeString(writer, body));
 }
 
 // internalOnly gate for /metrics, /status, /health/detailed (open in dev; in
@@ -150,13 +173,18 @@ void registerAdvices() {
   // reservation made by the upload guards (mirrors upload.js res.on('finish')).
   app.registerPostHandlingAdvice(
     [](const HttpRequestPtr& req, const HttpResponsePtr& resp) {
+      // Controllers log the detailed exception server-side. Never send their
+      // raw 500 bodies (which can contain database/provider details) in prod.
+      // Deliberately leave every non-500 response body untouched.
+      scrubProductionServerError(resp);
       applyCorsHeaders(req, resp);
       if (req->getAttributes()->find("__upload_release")) {
         pulse::filters::releaseUploadReservation(req);
       }
     });
 
-  // Pre-routing: answer CORS preflight immediately.
+  // Pre-routing: answer CORS preflight, then apply the process-wide abuse and
+  // JSON sanitation controls before any controller parses the body.
   app.registerPreRoutingAdvice(
     [](const HttpRequestPtr& req, AdviceCallback&& acb, AdviceChainCallback&& accb) {
       if (req->method() == Options) {
@@ -166,18 +194,55 @@ void registerAdvices() {
         acb(resp);
         return;
       }
+
+      if (g_shuttingDown.load()) {
+        Json::Value body;
+        body["status"] = "SHUTTING_DOWN";
+        acb(http::json(k503ServiceUnavailable, body));
+        return;
+      }
+
+      const std::string& path = req->path();
+      const bool health = path == "/health" || path == "/health/ready" ||
+                          path == "/health/detailed" || path == "/status";
+      if (!health) {
+        HttpResponsePtr limited;
+        const int max = static_cast<int>(std::clamp<int64_t>(
+            config().envInt("RATE_LIMIT_MAX_REQUESTS", 1000), 1, 1000000));
+        if (pulse::filters::rateLimited(
+                req, "rl:global:", max, false,
+                "Too many requests. Please slow down and try again later.",
+                "RATE_LIMIT_EXCEEDED", limited)) {
+          acb(limited);
+          return;
+        }
+      }
+
+      HttpResponsePtr invalidBody;
+      if (!pulse::filters::sanitizeJsonRequest(req, invalidBody)) {
+        acb(invalidBody);
+        return;
+      }
       accb();
     });
 }
 
-void gracefulShutdown(int sig) {
+void beginGracefulShutdown(int sig) {
   if (g_shuttingDown.exchange(true)) return;
   log::info("\xF0\x9F\x9B\x91 Signal {} received. Draining...", sig);
-  int drainMs = (int)config().envInt("SHUTDOWN_DRAIN_MS", 5000);
-  std::this_thread::sleep_for(std::chrono::milliseconds(drainMs));
-  db::disconnect();
-  cache().disconnect();
-  drogon::app().quit();
+  pulse::jobs::requestStop();
+  const int64_t drainMs = std::max<int64_t>(
+      0, std::min<int64_t>(60000,
+          config().envInt("SHUTDOWN_DRAIN_MS", 5000)));
+  drogon::app().getLoop()->runAfter(
+      static_cast<double>(drainMs) / 1000.0,
+      [] { drogon::app().quit(); });
+}
+
+// Async-signal-safe: only store the signal number. Logging, sleeping, service
+// teardown, and event-loop operations are performed later on the app loop.
+void signalHandler(int sig) {
+  g_pendingSignal = sig;
 }
 } // namespace
 
@@ -207,7 +272,7 @@ int main() {
   }
 
   // 3-4. Optional services + indexes.
-  initFirebaseIfPresent();
+  if (!initFirebaseIfPresent()) return 1;
   initSmtpIfPresent();
   db::createIndexes();
 
@@ -219,29 +284,54 @@ int main() {
   registerHealthEndpoints();
 
   // Signals.
-  std::signal(SIGTERM, gracefulShutdown);
-  std::signal(SIGINT, gracefulShutdown);
+  std::signal(SIGTERM, signalHandler);
+  std::signal(SIGINT, signalHandler);
 
   int port = cfg.server.port;
-  int threads = (int)cfg.envInt("THREAD_NUM", 0);
+  const int threads = static_cast<int>(std::clamp<int64_t>(
+      cfg.envInt("THREAD_NUM", 0), 0, 256));
   log::info("\xF0\x9F\x9A\x80 Pulse Backend Server running on port {}", port);
   log::info("\xF0\x9F\x8C\x8D Environment: {}", cfg.nodeEnv());
 
   auto& app = drogon::app();
-  // Max request body. Unlike the Node stack (multer gates uploads separately
-  // from express.json), Drogon's client_max_body_size is the single gate for
-  // ALL requests — including multipart media uploads. So it must match the
-  // original multer limit (UPLOAD_MAX_MB, default 25MB); a 1MB cap here 413s
-  // every real photo/video upload (snaps, reels, post media, avatars).
-  const long long uploadMaxMb = cfg.envInt("UPLOAD_MAX_MB", 25);
+  // Drogon has one transport-level body ceiling for every route. Size it for
+  // the largest configured multipart request; pre-routing sanitation separately
+  // enforces the much smaller JSON_BODY_LIMIT and upload handlers enforce both
+  // per-file size and file count.
+  const int64_t uploadMaxMb = std::max<int64_t>(
+      1, std::min<int64_t>(512, cfg.envInt("UPLOAD_MAX_MB", 25)));
+  const int64_t uploadMaxFiles = std::max<int64_t>(
+      1, std::min<int64_t>(20, cfg.envInt("UPLOAD_MAX_FILES", 5)));
+  const int64_t reelMaxMb = std::max<int64_t>(
+      1, std::min<int64_t>(1024, cfg.envInt("REEL_MAX_MB", 80)));
+  const int64_t maxRequestMb = std::max(uploadMaxMb * uploadMaxFiles + 2,
+                                        reelMaxMb + 2);
+  const int64_t keepaliveMs = std::clamp<int64_t>(
+      cfg.envInt("HTTP_KEEPALIVE_TIMEOUT_MS", 65000), 1000, 300000);
+  const int64_t wsMaxFrameBytes = std::clamp<int64_t>(
+      cfg.envInt("WS_MAX_FRAME_BYTES", 64 * 1024), 1024, 1024 * 1024);
   app.addListener("0.0.0.0", port)
      .setThreadNum(threads <= 0 ? 0 : threads)   // 0 => hardware concurrency
-     .setIdleConnectionTimeout((size_t)cfg.envInt("HTTP_KEEPALIVE_TIMEOUT_MS", 65000) / 1000)
-     .setClientMaxBodySize(uploadMaxMb * 1024 * 1024)
+     .setIdleConnectionTimeout(static_cast<size_t>(keepaliveMs / 1000))
+     .setClientMaxBodySize(static_cast<size_t>(maxRequestMb * 1024 * 1024))
+     .setClientMaxWebSocketMessageSize(static_cast<size_t>(wsMaxFrameBytes))
      .enableGzip(true)
      .setDocumentRoot("./public");
 
+  app.getLoop()->runEvery(0.1, [] {
+    const int sig = g_pendingSignal;
+    if (sig != 0) {
+      g_pendingSignal = 0;
+      beginGracefulShutdown(sig);
+    }
+  });
+
   app.run();
+  pulse::jobs::stop();
+  pulse::sockets::RealtimeController::shutdownInfrastructure();
+  pulse::sockets::PresenceHub::shutdownExistingInfrastructure();
+  cache().disconnect();
+  db::disconnect();
   log::info("\xF0\x9F\x91\x8B Graceful shutdown completed");
   return 0;
 }
@@ -254,10 +344,21 @@ int main() {
 // service headers when those units are present. Here we keep thin wrappers so
 // main is decoupled from whether those optional units exist yet.
 namespace {
-void initFirebaseIfPresent() {
-  // firebaseService initializes lazily; nothing required at boot. Logged for
-  // parity with server.js "Initializing Firebase...".
-  log::info("\xF0\x9F\x94\xA5 Initializing Firebase...");
+bool initFirebaseIfPresent() {
+  if (!config().getBool("features.enableFirebaseAuth", false)) {
+    log::info("Firebase authentication is disabled");
+    return true;
+  }
+
+  log::info("\xF0\x9F\x94\xA5 Initializing Firebase authentication...");
+  if (pulse::firebase().initialize()) return true;
+
+  if (config().isProduction()) {
+    log::error("Firebase authentication is enabled but initialization failed");
+    return false;
+  }
+  log::warn("Firebase authentication initialization failed; continuing in development");
+  return true;
 }
 void initSmtpIfPresent() {
   log::info("\xF0\x9F\x93\xA7 Initializing SMTP...");
