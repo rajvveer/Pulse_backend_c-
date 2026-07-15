@@ -1,9 +1,9 @@
 // upload_filters.hpp — upload guards, port of src/middlewares/upload.js.
 //
 // multer's per-file limit + the process-wide in-flight-bytes semaphore. Drogon
-// buffers the multipart body, so we gate on the declared Content-Length BEFORE
-// accepting the body:
-//   - 413 PAYLOAD_TOO_LARGE when Content-Length exceeds the per-request ceiling
+// buffers the multipart body, so the guard checks both Content-Length and the
+// actual buffered size (protecting against a missing/understated header):
+//   - 413 PAYLOAD_TOO_LARGE when either size exceeds the per-request ceiling
 //   - 503 UPLOAD_CAPACITY when accepting it would exceed the process-wide
 //     in-flight byte budget (load-shed rather than risk OOM)
 // The reservation is released when the request completes.
