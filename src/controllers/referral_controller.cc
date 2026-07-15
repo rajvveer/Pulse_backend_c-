@@ -19,16 +19,22 @@
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/types.hpp>
 #include <bsoncxx/oid.hpp>
+#include <openssl/rand.h>
 
 #include <mongocxx/collection.hpp>
+#include <mongocxx/client_session.hpp>
 #include <mongocxx/options/find.hpp>
+#include <mongocxx/options/find_one_and_update.hpp>
 #include <mongocxx/cursor.hpp>
+#include <mongocxx/exception/operation_exception.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <random>
+#include <cstdint>
+#include <limits>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 namespace pulse::controllers {
@@ -79,32 +85,49 @@ std::string toUpper(const std::string& s) {
 // alphanumeric id (a leading letter + base36 body); we only keep the first 8
 // chars and uppercase them, so an 8-char base36 string (leading letter,
 // uppercased) is functionally equivalent for a short human-friendly code.
+std::uint32_t secureUniform(std::uint32_t upperExclusive) {
+  if (upperExclusive == 0) throw std::invalid_argument("empty random range");
+  const std::uint64_t range =
+      static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1;
+  const std::uint64_t limit = range - (range % upperExclusive);
+  std::uint32_t value = 0;
+  do {
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&value), sizeof(value)) != 1)
+      throw std::runtime_error("secure referral-code generation failed");
+  } while (static_cast<std::uint64_t>(value) >= limit);
+  return value % upperExclusive;
+}
+
 std::string generateShortCode() {
   static const char letters[] = "abcdefghijklmnopqrstuvwxyz";
   static const char base36[]  = "abcdefghijklmnopqrstuvwxyz0123456789";
-  static thread_local std::mt19937 rng{std::random_device{}()};
-  std::uniform_int_distribution<int> letterDist(0, 25);
-  std::uniform_int_distribution<int> base36Dist(0, 35);
   std::string id;
   id.reserve(8);
-  id.push_back(letters[letterDist(rng)]);  // cuid2 always starts with a letter
-  for (int i = 1; i < 8; ++i) id.push_back(base36[base36Dist(rng)]);
+  id.push_back(letters[secureUniform(26)]);
+  for (int i = 1; i < 8; ++i) id.push_back(base36[secureUniform(36)]);
   return toUpper(id);
+}
+
+bool isDuplicateKey(const mongocxx::operation_exception& e) {
+  return e.code().value() == 11000 ||
+         std::string(e.what()).find("E11000") != std::string::npos;
 }
 
 bsoncxx::types::b_date nowDate() {
   return bsoncxx::types::b_date{std::chrono::system_clock::now()};
 }
 
-// user.badges?.some(b => b.type === 'early-adopter')
-bool hasBadge(const Json::Value& user, const std::string& type) {
-  if (!user.isObject() || !user.isMember("badges") || !user["badges"].isArray()) return false;
-  for (const auto& b : user["badges"]) {
-    if (b.isObject() && b.isMember("type") && b["type"].isString() && b["type"].asString() == type)
-      return true;
-  }
-  return false;
-}
+class ReferralRequestError : public std::runtime_error {
+public:
+  ReferralRequestError(drogon::HttpStatusCode status,
+                       const std::string& message)
+      : std::runtime_error(message), status_(status) {}
+
+  drogon::HttpStatusCode status() const noexcept { return status_; }
+
+private:
+  drogon::HttpStatusCode status_;
+};
 
 }  // namespace
 
@@ -133,11 +156,42 @@ void ReferralController::getMyCode(
         user.isMember("referralCode") && user["referralCode"].isString()
             ? user["referralCode"].asString() : "";
     if (referralCode.empty()) {
-      referralCode = generateShortCode();
-      if (oid)
-        col.update_one(make_document(kvp("_id", *oid)),
-                       make_document(kvp("$set", make_document(
-                           kvp("referralCode", referralCode)))));
+      mongocxx::options::find_one_and_update opts{};
+      opts.return_document(mongocxx::options::return_document::k_after);
+
+      for (int attempt = 0; attempt < 8 && referralCode.empty(); ++attempt) {
+        const std::string candidate = generateShortCode();
+        try {
+          auto updated = col.find_one_and_update(
+              make_document(
+                  kvp("_id", *oid),
+                  kvp("$or", make_array(
+                      make_document(kvp("referralCode", make_document(
+                          kvp("$exists", false)))),
+                      make_document(kvp("referralCode",
+                                        bsoncxx::types::b_null{})),
+                      make_document(kvp("referralCode", ""))))),
+              make_document(kvp("$set", make_document(
+                  kvp("referralCode", candidate),
+                  kvp("updatedAt", nowDate())))),
+              opts);
+          if (updated) {
+            referralCode = pulse::bsonjson::toJson(updated->view())
+                               .get("referralCode", "").asString();
+          } else {
+            // Another request generated this user's code first.
+            auto raced = col.find_one(make_document(kvp("_id", *oid)));
+            if (raced)
+              referralCode = pulse::bsonjson::toJson(raced->view())
+                                 .get("referralCode", "").asString();
+          }
+        } catch (const mongocxx::operation_exception& e) {
+          if (!isDuplicateKey(e)) throw;
+          // Candidate collision with another user; generate a fresh code.
+        }
+      }
+      if (referralCode.empty())
+        throw std::runtime_error("Failed to allocate a unique referral code");
     }
 
     const std::string shareUrl = "https://getpulse.app/join?ref=" + referralCode;
@@ -178,70 +232,101 @@ void ReferralController::applyCode(
       return;
     }
 
-    auto col = pulse::db::collection(pulse::models::user::kCollection);
-
     const std::string currentUserId = authUserId(req);
     auto currentOid = pulse::bsonjson::tryOid(currentUserId);
-    bsoncxx::v_noabi::stdx::optional<bsoncxx::document::value> currentFound;
-    if (currentOid) currentFound = col.find_one(make_document(kvp("_id", *currentOid)));
-    if (!currentFound) {
+    if (!currentOid) {
       callback(errMessage(drogon::k404NotFound, "User not found"));
       return;
     }
-    Json::Value currentUser = pulse::bsonjson::toJson(currentFound->view());
+    Json::Value referrer(Json::objectValue);
+    bool badgeAwarded = false;
 
-    // Already referred? (currentUser.referredBy is non-null)
-    if (currentUser.isMember("referredBy") && !currentUser["referredBy"].isNull()) {
-      callback(errMessage(drogon::k409Conflict, "You have already used a referral code"));
-      return;
-    }
+    // The claim, both badge awards, and count increment commit together. The
+    // referredBy:null predicate is the one-time gate, so only the winning
+    // concurrent request can reach the referrer's $inc.
+    pulse::db::ClientHandle dbHandle;
+    auto col = dbHandle.collection(pulse::models::user::kCollection);
+    auto session = dbHandle.client().start_session();
+    session.with_transaction([&](mongocxx::client_session* tx) {
+      badgeAwarded = false;
 
-    // Find referrer: { referralCode: code.toUpperCase(), isActive: true }
-    auto referrerFound = col.find_one(make_document(
-        kvp("referralCode", toUpper(code)), kvp("isActive", true)));
-    if (!referrerFound) {
-      callback(errMessage(drogon::k404NotFound, "Invalid referral code"));
-      return;
-    }
-    Json::Value referrer = pulse::bsonjson::toJson(referrerFound->view());
-    const std::string referrerId = referrer.get("_id", "").asString();
+      auto currentFound =
+          col.find_one(*tx, make_document(kvp("_id", *currentOid)));
+      if (!currentFound)
+        throw ReferralRequestError(drogon::k404NotFound, "User not found");
+      Json::Value currentUser =
+          pulse::bsonjson::toJson(currentFound->view());
+      if (currentUser.isMember("referredBy") &&
+          !currentUser["referredBy"].isNull()) {
+        throw ReferralRequestError(
+            drogon::k409Conflict, "You have already used a referral code");
+      }
 
-    // Can't refer yourself.
-    if (referrerId == currentUser.get("_id", "").asString()) {
-      callback(errMessage(drogon::k400BadRequest, "You cannot use your own referral code"));
-      return;
-    }
-    auto referrerOid = pulse::bsonjson::tryOid(referrerId);
+      auto referrerFound = col.find_one(
+          *tx, make_document(kvp("referralCode", toUpper(code)),
+                             kvp("isActive", true)));
+      if (!referrerFound)
+        throw ReferralRequestError(drogon::k404NotFound,
+                                   "Invalid referral code");
+      referrer = pulse::bsonjson::toJson(referrerFound->view());
+      auto referrerOid =
+          pulse::bsonjson::tryOid(referrer.get("_id", "").asString());
+      if (!referrerOid)
+        throw ReferralRequestError(drogon::k404NotFound,
+                                   "Invalid referral code");
+      if (*referrerOid == *currentOid)
+        throw ReferralRequestError(drogon::k400BadRequest,
+                                   "You cannot use your own referral code");
+
+      mongocxx::options::find_one_and_update claimOpts{};
+      claimOpts.return_document(mongocxx::options::return_document::k_after);
+      auto claimed = col.find_one_and_update(
+          *tx,
+          make_document(kvp("_id", *currentOid),
+                        // Equality to null also matches a missing field.
+                        kvp("referredBy", bsoncxx::types::b_null{})),
+          make_document(kvp("$set", make_document(
+              kvp("referredBy", *referrerOid), kvp("updatedAt", nowDate())))),
+          claimOpts);
+      if (!claimed)
+        throw ReferralRequestError(
+            drogon::k409Conflict, "You have already used a referral code");
+
+      // Badge type is the identity. Conditional pushes prevent duplicate badge
+      // types even though each earnedAt value is necessarily different.
+      auto currentBadgeResult = col.update_one(
+          *tx,
+          make_document(kvp("_id", *currentOid),
+                        kvp("badges.type", make_document(
+                            kvp("$ne", "early-adopter")))),
+          make_document(kvp("$push", make_document(kvp(
+              "badges", make_document(kvp("type", "early-adopter"),
+                                      kvp("earnedAt", nowDate())))))));
+      badgeAwarded = currentBadgeResult &&
+                     currentBadgeResult->modified_count() == 1;
+
+      auto countResult = col.update_one(
+          *tx,
+          make_document(kvp("_id", *referrerOid), kvp("isActive", true)),
+          make_document(
+              kvp("$inc", make_document(kvp("referralCount", 1))),
+              kvp("$set", make_document(kvp("updatedAt", nowDate())))));
+      if (!countResult || countResult->matched_count() != 1)
+        throw ReferralRequestError(drogon::k404NotFound,
+                                   "Invalid referral code");
+
+      col.update_one(
+          *tx,
+          make_document(kvp("_id", *referrerOid),
+                        kvp("badges.type", make_document(
+                            kvp("$ne", "early-adopter")))),
+          make_document(kvp("$push", make_document(kvp(
+              "badges", make_document(kvp("type", "early-adopter"),
+                                      kvp("earnedAt", nowDate())))))));
+    });
 
     // ── Apply referral to current user (currentUser.save()) ──
-    // currentUser.referredBy = referrer._id; award early-adopter badge if missing.
-    const bool hasEarlyAdopter = hasBadge(currentUser, "early-adopter");
-    bld::document currentSet;
-    if (referrerOid) currentSet.append(kvp("referredBy", *referrerOid));
-    bld::document currentUpdate;
-    currentUpdate.append(kvp("$set", currentSet.extract()));
-    if (!hasEarlyAdopter) {
-      currentUpdate.append(kvp("$push", make_document(kvp("badges",
-          make_document(kvp("type", "early-adopter"), kvp("earnedAt", nowDate()))))));
-    }
-    if (currentOid)
-      col.update_one(make_document(kvp("_id", *currentOid)), currentUpdate.extract());
-
     // ── Update referrer (referrer.save()) ──
-    // referrer.referralCount = (referralCount || 0) + 1; award badge if missing.
-    long long referrerCount =
-        referrer.isMember("referralCount") ? referrer["referralCount"].asInt64() : 0;
-    const bool referrerHasBadge = hasBadge(referrer, "early-adopter");
-    bld::document referrerUpdate;
-    referrerUpdate.append(kvp("$set", make_document(
-        kvp("referralCount", (std::int64_t)(referrerCount + 1)))));
-    if (!referrerHasBadge) {
-      referrerUpdate.append(kvp("$push", make_document(kvp("badges",
-          make_document(kvp("type", "early-adopter"), kvp("earnedAt", nowDate()))))));
-    }
-    if (referrerOid)
-      col.update_one(make_document(kvp("_id", *referrerOid)), referrerUpdate.extract());
-
     // res.json({ success:true, message, data:{ referredBy:{username,displayName}, badgeAwarded } })
     Json::Value referredBy(Json::objectValue);
     referredBy["username"] = referrer.get("username", Json::Value(Json::nullValue));
@@ -254,13 +339,15 @@ void ReferralController::applyCode(
 
     Json::Value data(Json::objectValue);
     data["referredBy"] = referredBy;
-    data["badgeAwarded"] = !hasEarlyAdopter;
+    data["badgeAwarded"] = badgeAwarded;
 
     Json::Value extra(Json::objectValue);
     extra["message"] =
         "Referral code applied successfully! You both earned an Early Adopter badge \xF0\x9F\x8E\x89";
     extra["data"] = data;
     callback(pulse::http::success(extra));
+  } catch (const ReferralRequestError& e) {
+    callback(errMessage(e.status(), e.what()));
   } catch (const std::exception& e) {
     pulse::log::error("applyCode error: {}", e.what());
     callback(errMessage(drogon::k500InternalServerError, "Failed to apply referral code"));
