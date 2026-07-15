@@ -90,6 +90,25 @@ std::string currentUserId(const drogon::HttpRequestPtr& req) {
   return user["userId"].asString();
 }
 
+bool canAccessSnap(const Json::Value& snap, const std::string& userId) {
+  const std::string authorId = snap.get("user", "").asString();
+  if (authorId == userId) return true;
+
+  const std::string audience = snap.get("audience", "").asString();
+  if (audience == "direct") {
+    if (!snap.isMember("recipients") || !snap["recipients"].isArray()) return false;
+    for (const auto& recipient : snap["recipients"]) {
+      if (recipient.isString() && recipient.asString() == userId) return true;
+    }
+    return false;
+  }
+
+  if (audience != "story") return false;
+  // Stories are exposed by the story rail only to the author's followers.
+  return !authorId.empty() &&
+      pulse::models::follow::isFollowing(userId, authorId);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -386,6 +405,19 @@ void SnapController::reactSnap(const HttpRequestPtr& req,
     auto oid = pulse::bsonjson::oid(snapId);
     const std::string field = "reactions." + userId;
 
+    mongocxx::options::find accessOpts;
+    accessOpts.projection(make_document(kvp("audience", 1), kvp("user", 1),
+                                        kvp("recipients", 1)));
+    auto activeFilter = make_document(
+        kvp("_id", oid),
+        kvp("expiresAt", make_document(kvp(
+            "$gt", bsoncxx::types::b_date{std::chrono::system_clock::now()}))));
+    auto accessDoc = col.find_one(activeFilter.view(), accessOpts);
+    if (!accessDoc)
+      return callback(failMsg(drogon::k404NotFound, "Snap not found"));
+    if (!canAccessSnap(pulse::bsonjson::toJson(accessDoc->view()), userId))
+      return callback(failMsg(drogon::k403Forbidden, "Not authorized"));
+
     // reaction ? $set:{[`reactions.${userId}`]:reaction} : $unset:{[`reactions.${userId}`]:''}
     bsoncxx::document::value update = reaction.empty()
         ? make_document(kvp("$unset", make_document(kvp(field, ""))))
@@ -395,7 +427,11 @@ void SnapController::reactSnap(const HttpRequestPtr& req,
     mongocxx::options::find_one_and_update opts;
     opts.return_document(mongocxx::options::return_document::k_after);
     opts.projection(make_document(kvp("reactions", 1)));
-    auto snap = col.find_one_and_update(make_document(kvp("_id", oid)), update.view(), opts);
+    auto updateFilter = make_document(
+        kvp("_id", oid),
+        kvp("expiresAt", make_document(kvp(
+            "$gt", bsoncxx::types::b_date{std::chrono::system_clock::now()}))));
+    auto snap = col.find_one_and_update(updateFilter.view(), update.view(), opts);
     if (!snap) {
       return callback(failMsg(drogon::k404NotFound, "Snap not found"));
     }

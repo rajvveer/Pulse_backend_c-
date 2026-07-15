@@ -164,6 +164,27 @@ std::string reelHexId(const Json::Value& r) {
   return "";
 }
 
+HttpResponsePtr reelFailure(drogon::HttpStatusCode code,
+                            const std::string& message) {
+  Json::Value body(Json::objectValue);
+  body["success"] = false;
+  body["message"] = message;
+  return pulse::http::json(code, std::move(body));
+}
+
+// Reels do not have audience-specific visibility, but legacy documents may
+// carry an isActive flag. Treat an explicitly inactive reel as inaccessible and
+// reject malformed ids instead of querying a string-typed _id.
+std::optional<Json::Value> findAccessibleReel(const bsoncxx::oid& reelId) {
+  auto col = pulse::db::collection(pulse::models::reel::kCollection);
+  auto filter = make_document(
+      kvp("_id", reelId),
+      kvp("isActive", make_document(kvp("$ne", false))));
+  auto found = col.find_one(filter.view());
+  if (!found) return std::nullopt;
+  return bj::toJson(found->view());
+}
+
 // ── Inline helpers ported from the JS controller ──
 
 // HELPER: Optimize Cloudinary URL (getOptimizedVideoUrl). Delegates to the
@@ -846,23 +867,19 @@ void ReelController::toggleLike(const HttpRequestPtr& req,
     Json::Value user = authUser(req);
     std::string userId = authUserId(user);
 
-    // Reel.findById(reelId)
-    Json::Value reel(Json::nullValue);
-    {
-      auto col = pulse::db::collection(pulse::models::reel::kCollection);
-      bld::document f;
-      if (auto o = bj::tryOid(reelId)) f.append(kvp("_id", *o));
-      else                            f.append(kvp("_id", reelId));
-      auto found = col.find_one(f.view());
-      if (found) reel = bj::toJson(found->view());
-    }
-    if (!reel.isObject()) {
-      Json::Value body(Json::objectValue);
-      body["success"] = false;
-      body["message"] = "Reel not found";
-      callback(pulse::http::json(drogon::k404NotFound, body));
+    auto reelOid = bj::tryOid(reelId);
+    if (!reelOid) {
+      callback(reelFailure(drogon::k400BadRequest, "Invalid reel id"));
       return;
     }
+
+    // Reel.findById(reelId)
+    auto reelFound = findAccessibleReel(*reelOid);
+    if (!reelFound) {
+      callback(reelFailure(drogon::k404NotFound, "Reel not found"));
+      return;
+    }
+    Json::Value reel = std::move(*reelFound);
 
     // Atomic Like collection toggle.
     auto result = pulse::models::like::toggleLike(
@@ -1016,6 +1033,13 @@ void ReelController::addComment(const HttpRequestPtr& req,
     Json::Value user = authUser(req);
     std::string userId = authUserId(user);
 
+    auto reelOid = bj::tryOid(reelId);
+    auto userOid = bj::tryOid(userId);
+    if (!reelOid || !userOid) {
+      callback(reelFailure(drogon::k400BadRequest, "Invalid reel or user id"));
+      return;
+    }
+
     std::string content = (body.isMember("content") && body["content"].isString())
                               ? body["content"].asString() : "";
     // if (!content) -> 400 Content required.  (Mirrors JS falsy check on body.content.)
@@ -1032,22 +1056,12 @@ void ReelController::addComment(const HttpRequestPtr& req,
     }
 
     // Reel.findById(reelId)
-    Json::Value reel(Json::nullValue);
-    {
-      auto col = pulse::db::collection(pulse::models::reel::kCollection);
-      bld::document f;
-      if (auto o = bj::tryOid(reelId)) f.append(kvp("_id", *o));
-      else                            f.append(kvp("_id", reelId));
-      auto found = col.find_one(f.view());
-      if (found) reel = bj::toJson(found->view());
-    }
-    if (!reel.isObject()) {
-      Json::Value b(Json::objectValue);
-      b["success"] = false;
-      b["message"] = "Reel not found";
-      callback(pulse::http::json(drogon::k404NotFound, b));
+    auto reelFound = findAccessibleReel(*reelOid);
+    if (!reelFound) {
+      callback(reelFailure(drogon::k404NotFound, "Reel not found"));
       return;
     }
+    Json::Value reel = std::move(*reelFound);
 
     // ReelComment.create({ reel, author, content, type:type||'text',
     //                      parentComment: parentCommentId||null })
@@ -1057,6 +1071,26 @@ void ReelController::addComment(const HttpRequestPtr& req,
     std::string parentCommentId;
     if (body.isMember("parentCommentId") && body["parentCommentId"].isString())
       parentCommentId = body["parentCommentId"].asString();
+
+    std::optional<bsoncxx::oid> parentCommentOid;
+    if (!parentCommentId.empty()) {
+      parentCommentOid = bj::tryOid(parentCommentId);
+      if (!parentCommentOid) {
+        callback(reelFailure(drogon::k400BadRequest,
+                             "Invalid parent comment id"));
+        return;
+      }
+
+      auto comments =
+          pulse::db::collection(pulse::models::reelcomment::kCollection);
+      auto parent = comments.find_one(make_document(
+          kvp("_id", *parentCommentOid), kvp("reel", *reelOid)));
+      if (!parent) {
+        callback(reelFailure(drogon::k404NotFound,
+                             "Parent comment not found"));
+        return;
+      }
+    }
 
     Json::Value doc(Json::objectValue);
     doc["reel"]          = reelId;
@@ -1071,12 +1105,12 @@ void ReelController::addComment(const HttpRequestPtr& req,
     {
       bld::document insert;
       insert.append(kvp("_id", newId));
-      appendRef(insert, "reel", reelId);
-      appendRef(insert, "author", userId);
+      insert.append(kvp("reel", *reelOid));
+      insert.append(kvp("author", *userOid));
       insert.append(kvp("content", defaulted["content"].asString()));
       insert.append(kvp("type", type));
-      if (parentCommentId.empty()) insert.append(kvp("parentComment", bsoncxx::types::b_null{}));
-      else                         appendRef(insert, "parentComment", parentCommentId);
+      if (!parentCommentOid) insert.append(kvp("parentComment", bsoncxx::types::b_null{}));
+      else                   insert.append(kvp("parentComment", *parentCommentOid));
       insert.append(kvp("likes", make_array()));
       long long now = nowMillis();
       insert.append(kvp("createdAt", bsoncxx::types::b_date{std::chrono::milliseconds{now}}));
@@ -1108,10 +1142,7 @@ void ReelController::addComment(const HttpRequestPtr& req,
     // Reel.findByIdAndUpdate(reelId, { $inc: { commentsCount: 1 } })
     {
       auto col = pulse::db::collection(pulse::models::reel::kCollection);
-      bld::document f;
-      if (auto o = bj::tryOid(reelId)) f.append(kvp("_id", *o));
-      else                            f.append(kvp("_id", reelId));
-      col.update_one(f.view(),
+      col.update_one(make_document(kvp("_id", *reelOid)),
                      make_document(kvp("$inc", make_document(kvp("commentsCount", 1)))));
     }
 
@@ -1139,6 +1170,17 @@ void ReelController::getComments(const HttpRequestPtr& req,
                                  std::function<void(const HttpResponsePtr&)>&& callback,
                                  std::string reelId) {
   try {
+    auto reelOid = bj::tryOid(reelId);
+    if (!reelOid) {
+      callback(reelFailure(drogon::k400BadRequest, "Invalid reel id"));
+      return;
+    }
+    auto reelFound = findAccessibleReel(*reelOid);
+    if (!reelFound) {
+      callback(reelFailure(drogon::k404NotFound, "Reel not found"));
+      return;
+    }
+
     std::string sortMode = req->getParameter("sort");
     if (sortMode.empty()) sortMode = "best";
     int page = clampParam(req->getParameter("page"), 1, 1, 100);
@@ -1152,8 +1194,7 @@ void ReelController::getComments(const HttpRequestPtr& req,
     {
       auto col = pulse::db::collection(pulse::models::reelcomment::kCollection);
       bld::document f;
-      if (auto o = bj::tryOid(reelId)) f.append(kvp("reel", *o));
-      else                            f.append(kvp("reel", reelId));
+      f.append(kvp("reel", *reelOid));
       f.append(kvp("parentComment", bsoncxx::types::b_null{}));
       mongocxx::options::find opts{};
       opts.sort(make_document(kvp("createdAt", -1)));
@@ -1170,9 +1211,14 @@ void ReelController::getComments(const HttpRequestPtr& req,
       for (auto& c : comments) {
         Json::Value replies(Json::arrayValue);
         std::string cid = reelHexId(c);
+        auto commentOid = bj::tryOid(cid);
+        if (!commentOid) {
+          c["replies"] = replies;
+          continue;
+        }
         bld::document rf;
-        if (auto o = bj::tryOid(cid)) rf.append(kvp("parentComment", *o));
-        else                          rf.append(kvp("parentComment", cid));
+        rf.append(kvp("parentComment", *commentOid));
+        rf.append(kvp("reel", *reelOid));
         mongocxx::options::find ropts{};
         ropts.sort(make_document(kvp("createdAt", 1)));
         ropts.limit(30);
@@ -1185,20 +1231,7 @@ void ReelController::getComments(const HttpRequestPtr& req,
     populateUsers(comments, "author", /*stats=*/false, /*authMethods=*/false);
 
     // Reel.findById(reelId).select('user').lean() — OP boost id.
-    std::string opId;
-    {
-      auto col = pulse::db::collection(pulse::models::reel::kCollection);
-      bld::document f;
-      if (auto o = bj::tryOid(reelId)) f.append(kvp("_id", *o));
-      else                            f.append(kvp("_id", reelId));
-      mongocxx::options::find opts{};
-      opts.projection(make_document(kvp("user", 1)));
-      auto found = col.find_one(f.view(), opts);
-      if (found) {
-        Json::Value reel = bj::toJson(found->view());
-        opId = reelUserId(reel);
-      }
-    }
+    std::string opId = reelUserId(*reelFound);
 
     // CommentsAlgo.rankComments(comments, { mode:sortMode, opId, includeReplies:true })
     Json::Value ranked = rankComments(comments, sortMode, opId);
@@ -1243,21 +1276,31 @@ void ReelController::getComments(const HttpRequestPtr& req,
 void ReelController::toggleCommentLike(const HttpRequestPtr& req,
                                        std::function<void(const HttpResponsePtr&)>&& callback,
                                        std::string reelId, std::string commentId) {
-  (void)reelId;  // :reelId is part of the path but unused by the JS handler.
   try {
     Json::Value user = authUser(req);
     std::string userId = authUserId(user);
 
-    // ReelComment.findById(commentId).select('_id').lean()
+    auto reelOid = bj::tryOid(reelId);
+    auto commentOid = bj::tryOid(commentId);
+    if (!reelOid || !commentOid) {
+      callback(reelFailure(drogon::k400BadRequest,
+                           "Invalid reel or comment id"));
+      return;
+    }
+    if (!findAccessibleReel(*reelOid)) {
+      callback(reelFailure(drogon::k404NotFound, "Reel not found"));
+      return;
+    }
+
+    // The nested route only operates on a comment belonging to this reel.
     bool exists = false;
     {
       auto col = pulse::db::collection(pulse::models::reelcomment::kCollection);
-      bld::document f;
-      if (auto o = bj::tryOid(commentId)) f.append(kvp("_id", *o));
-      else                                f.append(kvp("_id", commentId));
       mongocxx::options::find opts{};
       opts.projection(make_document(kvp("_id", 1)));
-      auto found = col.find_one(f.view(), opts);
+      auto found = col.find_one(
+          make_document(kvp("_id", *commentOid), kvp("reel", *reelOid)),
+          opts);
       exists = static_cast<bool>(found);
     }
     if (!exists) {

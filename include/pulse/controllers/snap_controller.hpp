@@ -24,7 +24,8 @@ public:
   METHOD_LIST_BEGIN
   // Create a snap (story or direct). Multipart: file + fields.
   ADD_METHOD_TO(SnapController::createSnap, "/api/v1/snaps", Post,
-                "pulse::filters::AuthFilter", "pulse::filters::UploadLimiter");
+                "pulse::filters::AuthFilter", "pulse::filters::UploadLimiter",
+                "pulse::filters::ReelGuard");
 
   // Story rail (own + followed authors' active stories, grouped by author).
   ADD_METHOD_TO(SnapController::getStoryRail, "/api/v1/snaps/rail", Get,
