@@ -24,6 +24,8 @@
 #include "pulse/models/message.hpp"
 #include "pulse/models/conversation.hpp"
 #include "pulse/models/user.hpp"
+#include "pulse/filters/auth_filters.hpp"
+#include "pulse/config.hpp"
 
 #include <sw/redis++/redis++.h>
 
@@ -48,6 +50,8 @@
 using namespace drogon;
 
 namespace pulse::sockets {
+
+std::atomic<RealtimeController*> RealtimeController::activeInstance_{nullptr};
 
 namespace bld = bsoncxx::builder::basic;
 using bld::kvp;
@@ -101,10 +105,40 @@ std::string conversationIdFrom(const Json::Value& data) {
 // mongoose.isValidObjectId
 bool isValidOid(const std::string& hex) { return pulse::bsonjson::isValidOid(hex); }
 
+bool isValidCallId(const std::string& value) {
+  return value.size() == 32 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char c) {
+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+         });
+}
+
+bool hasParticipant(const Json::Value& conversation, const std::string& userId) {
+  if (!conversation.isObject() || !conversation["participants"].isArray())
+    return false;
+  for (const auto& participant : conversation["participants"]) {
+    if (participant.isString() && participant.asString() == userId) return true;
+    if (participant.isObject() &&
+        participant.get("_id", "").asString() == userId) return true;
+  }
+  return false;
+}
+
 // ── Multi-user safety caps ──
 // Max concurrent sockets per user (a handful of devices/tabs is plenty; beyond
 // this is abuse). Bounds per-user rate budget + memory.
-constexpr int kMaxConnsPerUser = 10;
+int maxConnectionsPerUser() {
+  static const int value = static_cast<int>(std::clamp<std::int64_t>(
+      pulse::config().envInt("WS_MAX_CONNECTIONS_PER_USER", 10), 1, 100));
+  return value;
+}
+
+// Bound allocation and JSON parsing before database-backed auth revalidation.
+std::size_t maxInboundFrameBytes() {
+  static const auto value = static_cast<std::size_t>(std::clamp<std::int64_t>(
+      pulse::config().envInt("WS_MAX_FRAME_BYTES", 64 * 1024),
+      1024, 1024 * 1024));
+  return value;
+}
 // Max rooms a single connection may join (conversations + location). Stops a
 // client from growing rooms_ without bound via join-room/join-location.
 constexpr size_t kMaxRoomsPerConn = 200;
@@ -164,6 +198,7 @@ bool RealtimeLimiter::consumeWarn() {
 //  RealtimeController
 // ─────────────────────────────────────────────────────────────────────────────
 RealtimeController::RealtimeController() {
+  activeInstance_.store(this);
   // A process-stable instance id so our own published frames are not delivered
   // back to us a second time (we already delivered them locally).
   std::ostringstream os;
@@ -176,9 +211,76 @@ RealtimeController::RealtimeController() {
     pulse::log::error("Realtime: failed to create Redis publisher: {}", e.what());
   }
   startSubscriber();
+  startAuthMonitor();
 }
 
-RealtimeController::~RealtimeController() { stopSubscriber(); }
+RealtimeController::~RealtimeController() {
+  stopAuthMonitor();
+  stopSubscriber();
+  RealtimeController* expected = this;
+  activeInstance_.compare_exchange_strong(expected, nullptr);
+}
+
+void RealtimeController::shutdownInfrastructure() {
+  RealtimeController* self = activeInstance_.load();
+  if (!self) return;
+
+  std::vector<WebSocketConnectionPtr> sockets;
+  {
+    std::lock_guard<std::mutex> lock(self->connMu_);
+    sockets.reserve(self->conns_.size());
+    for (const auto& entry : self->conns_) sockets.push_back(entry.second);
+  }
+  for (const auto& socket : sockets) {
+    if (socket && socket->connected())
+      socket->shutdown(CloseCode::kEndpointGone, "Server shutting down");
+  }
+  self->stopAuthMonitor();
+  self->stopSubscriber();
+}
+
+void RealtimeController::startAuthMonitor() {
+  if (authRunning_.exchange(true)) return;
+  authThread_ = std::thread([this] {
+    const auto interval = std::chrono::seconds(std::max<int64_t>(
+        5, std::min<int64_t>(300,
+            pulse::config().envInt("WS_AUTH_RECHECK_SEC", 30))));
+    std::unique_lock<std::mutex> waitLock(authWaitMu_);
+    while (authRunning_) {
+      if (authWaitCv_.wait_for(waitLock, interval,
+                               [this] { return !authRunning_.load(); }))
+        break;
+      waitLock.unlock();
+
+      std::vector<WebSocketConnectionPtr> sockets;
+      {
+        std::lock_guard<std::mutex> lock(connMu_);
+        sockets.reserve(conns_.size());
+        for (const auto& [id, socket] : conns_) sockets.push_back(socket);
+      }
+      for (const auto& socket : sockets) {
+        auto st = state(socket);
+        if (!st) continue;
+        pulse::AccessClaims claims;
+        if (pulse::filters::validateAccessToken(st->accessToken, claims) !=
+                pulse::filters::AccessTokenStatus::Valid ||
+            claims.userId != st->userId) {
+          socket->shutdown(CloseCode::kViolation,
+                           "Authentication expired or revoked");
+        } else if (st->presenceRegistered.load()) {
+          pulse::presence().touch(st->userId);
+        }
+      }
+      waitLock.lock();
+    }
+  });
+}
+
+void RealtimeController::stopAuthMonitor() {
+  if (!authRunning_.exchange(false)) return;
+  authWaitCv_.notify_all();
+  if (authThread_.joinable()) authThread_.join();
+}
 
 std::shared_ptr<ConnState> RealtimeController::state(
     const WebSocketConnectionPtr& conn) {
@@ -202,15 +304,14 @@ std::string RealtimeController::connId(const WebSocketConnectionPtr& conn) {
 // ── Handshake auth (server.js io.use) + user_<id> room join (server.js) ──────
 void RealtimeController::handleNewConnection(const HttpRequestPtr& req,
                                              const WebSocketConnectionPtr& conn) {
-  // Token from the `token` query param, falling back to Authorization header.
+  // Prefer Authorization so credentials do not enter proxy/access logs. Keep
+  // the query parameter only as a legacy-client fallback.
   // (server.js read socket.handshake.auth.token; on raw WS the auth payload
   // travels as a query param or the standard Authorization header.)
-  std::string token = req->getParameter("token");
-  if (token.empty()) {
-    std::string auth = req->getHeader("authorization");
-    if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
-    else if (!auth.empty()) token = auth;
-  }
+  std::string token;
+  const std::string auth = req->getHeader("authorization");
+  if (auth.rfind("Bearer ", 0) == 0) token = auth.substr(7);
+  if (token.empty()) token = req->getParameter("token");
 
   if (token.empty()) {
     pulse::log::warn("\xE2\x9B\x94 Socket connection rejected \xE2\x80\x94 no auth token provided");
@@ -219,17 +320,17 @@ void RealtimeController::handleNewConnection(const HttpRequestPtr& req,
   }
 
   pulse::AccessClaims claims;
-  try {
-    // Same verification path as REST: pinned algorithm, issuer, audience, type.
-    claims = pulse::jwt().verifyAccessToken(token);
-  } catch (const pulse::JwtError& e) {
-    pulse::log::warn("\xE2\x9B\x94 Socket connection rejected \xE2\x80\x94 {}", e.what());
+  if (pulse::filters::validateAccessToken(token, claims) !=
+      pulse::filters::AccessTokenStatus::Valid) {
+    pulse::log::warn(
+        "Socket connection rejected - invalid/revoked token or inactive session");
     conn->forceClose();
     return;
   }
 
   auto st = std::make_shared<ConnState>();
   st->userId = claims.userId;
+  st->accessToken = token;
   // Process-unique connection id (used for conns_ keys + pub/sub exclusion).
   st->id = instanceId_ + ":" + std::to_string(connSeq_.fetch_add(1) + 1);
   // socket.user — lightweight identity (server.js).
@@ -245,9 +346,10 @@ void RealtimeController::handleNewConnection(const HttpRequestPtr& req,
   {
     std::lock_guard<std::mutex> lk(connMu_);
     int& n = userConnCount_[st->userId];
-    if (n >= kMaxConnsPerUser) {
+    const int cap = maxConnectionsPerUser();
+    if (n >= cap) {
       pulse::log::warn("Socket rejected — user {} at connection cap ({})",
-                       st->userId, kMaxConnsPerUser);
+                       st->userId, cap);
       // Drop the context so handleConnectionClosed doesn't double-decrement.
       conn->setContext(nullptr);
       conn->forceClose();
@@ -267,7 +369,10 @@ void RealtimeController::handleNewConnection(const HttpRequestPtr& req,
   // presence for everyone. INCR here keeps the counter symmetric per socket.
   if (!st->userId.empty()) {
     try {
-      bool justCameOnline = pulse::presence().addConnection(st->userId);
+      bool registered = false;
+      bool justCameOnline =
+          pulse::presence().addConnection(st->userId, registered);
+      st->presenceRegistered.store(registered);
       if (justCameOnline) notifyConversationPeers(conn, true);
     } catch (const std::exception& e) {
       pulse::log::error("presence addConnection error: {}", e.what());
@@ -279,13 +384,41 @@ void RealtimeController::handleNewConnection(const HttpRequestPtr& req,
 void RealtimeController::handleNewMessage(const WebSocketConnectionPtr& conn,
                                           std::string&& message,
                                           const WebSocketMessageType& type) {
+  auto st = state(conn);
+  if (!st) return;
+
+  // Control frames are handled by the transport and require no DB lookup.
   if (type == WebSocketMessageType::Ping ||
       type == WebSocketMessageType::Pong ||
       type == WebSocketMessageType::Close)
     return;
 
-  auto st = state(conn);
-  if (!st) return;
+  if (type != WebSocketMessageType::Text) {
+    conn->shutdown(CloseCode::kInvalidMessage, "Text frames required");
+    return;
+  }
+  if (message.size() > maxInboundFrameBytes()) {
+    conn->shutdown(CloseCode::kMessageTooBig, "Frame too large");
+    return;
+  }
+
+  // Stop floods in memory before the DB-backed session revalidation below.
+  if (!st->limiter.allow("default", nowMs())) {
+    if (st->limiter.consumeWarn()) {
+      Json::Value limited;
+      limited["category"] = "default";
+      emitTo(conn, "rate_limited", limited);
+    }
+    return;
+  }
+
+  pulse::AccessClaims currentClaims;
+  if (pulse::filters::validateAccessToken(st->accessToken, currentClaims) !=
+          pulse::filters::AccessTokenStatus::Valid ||
+      currentClaims.userId != st->userId) {
+    conn->shutdown(CloseCode::kViolation, "Authentication expired or revoked");
+    return;
+  }
 
   Json::Value frame;
   if (!parseJson(message, frame) || !frame.isObject()) return;
@@ -392,6 +525,7 @@ void RealtimeController::handleConnectionClosed(
   // it never INCR'd presence or userConnCount_ and was never put in conns_, so
   // skip all teardown to avoid a spurious decrement / offline broadcast.
   if (!st) return;
+  if (st->closed.exchange(true)) return;
 
   // socket.on('disconnect') in realtime.js.
   handleDisconnect(conn);
@@ -584,10 +718,15 @@ void RealtimeController::startSubscriber() {
         while (subRunning_) {
           subscriber.consume();
         }
+      } catch (const sw::redis::TimeoutError&) {
+        // Subscriber reads are intentionally bounded so shutdown can join.
+        // An idle channel timing out is normal; reconnect without log spam.
+        if (!subRunning_) break;
       } catch (const std::exception& e) {
         if (!subRunning_) break;
         pulse::log::error("Realtime: subscriber loop error: {} — retrying", e.what());
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        for (int i = 0; i < 10 && subRunning_; ++i)
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }
   });
@@ -595,10 +734,19 @@ void RealtimeController::startSubscriber() {
 
 void RealtimeController::stopSubscriber() {
   if (!subRunning_.exchange(false)) return;
-  if (subThread_.joinable()) {
-    // Best-effort: the consume() call may block; detach so shutdown is not stuck.
-    subThread_.detach();
+  try {
+    if (pub_) {
+      Json::Value wake(Json::objectValue);
+      wake["origin"] = instanceId_;
+      wake["frame"] = "";
+      pub_->publish("socketio:room:__shutdown", toCompactJson(wake));
+    }
+  } catch (...) {
   }
+  if (subThread_.joinable()) {
+    subThread_.join();
+  }
+  sub_.reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -798,6 +946,35 @@ void RealtimeController::handleSendMessage(const WebSocketConnectionPtr& conn,
       return;
     }
 
+    // A reply target must belong to the same conversation. Without this check a
+    // participant could attach (and broadcast a preview of) a message from a
+    // different conversation whose ObjectId they learned elsewhere.
+    if (!replyTo.empty()) {
+      if (!isValidOid(replyTo)) {
+        Json::Value cb; cb["status"] = "error";
+        cb["message"] = "Invalid reply target";
+        ack(conn, ackId, cb);
+        return;
+      }
+      try {
+        auto messages = pulse::db::collection(pulse::models::message::kCollection);
+        auto reply = messages.find_one(make_document(
+            kvp("_id", pulse::bsonjson::oid(replyTo)),
+            kvp("conversation", pulse::bsonjson::oid(conversationId))));
+        if (!reply) {
+          Json::Value cb; cb["status"] = "error";
+          cb["message"] = "Reply target is not in this conversation";
+          ack(conn, ackId, cb);
+          return;
+        }
+      } catch (...) {
+        Json::Value cb; cb["status"] = "error";
+        cb["message"] = "Unable to validate reply target";
+        ack(conn, ackId, cb);
+        return;
+      }
+    }
+
     // A. Create the message (ONE write). Mirror Message.create(...) defaults.
     Json::Value mdoc(Json::objectValue);
     mdoc["conversation"] = conversationId;
@@ -881,7 +1058,9 @@ void RealtimeController::handleSendMessage(const WebSocketConnectionPtr& conn,
         ropts.projection(make_document(kvp("content", 1), kvp("sender", 1),
                                        kvp("type", 1), kvp("media", 1)));
         auto rdoc = mcol.find_one(
-            make_document(kvp("_id", pulse::bsonjson::oid(replyTo))), ropts);
+            make_document(kvp("_id", pulse::bsonjson::oid(replyTo)),
+                          kvp("conversation",
+                              pulse::bsonjson::oid(conversationId))), ropts);
         if (rdoc) {
           Json::Value reply = pulse::bsonjson::toJson(rdoc->view());
           // populate('sender', 'username name avatar profile.avatar')
@@ -1235,14 +1414,48 @@ void RealtimeController::notifyConversationPeers(
 //  conversation here (a call is a transient peer action, and the callee can
 //  reject) — but we DO require a `to` user id and a `callId` to relay.
 // ─────────────────────────────────────────────────────────────────────────────
-void RealtimeController::relayCallEvent(const WebSocketConnectionPtr& conn,
+bool RealtimeController::relayCallEvent(const WebSocketConnectionPtr& conn,
                                         const std::vector<std::string>& events,
                                         const Json::Value& data) {
   auto st = state(conn);
-  if (!st) return;
+  if (!st) return false;
+
+  if (!st->limiter.allow("presence", nowMs())) {
+    if (st->limiter.consumeWarn()) {
+      Json::Value limited; limited["category"] = "call";
+      emitTo(conn, "rate_limited", limited);
+    }
+    return false;
+  }
 
   const std::string to = str(data, "to");
-  if (to.empty() || !isValidOid(to)) return;  // need a valid recipient
+  const std::string callId = str(data, "callId");
+  const std::string conversationId = str(data, "conversationId");
+  if (to.empty() || to == st->userId || !isValidOid(to) ||
+      !isValidCallId(callId) || !isValidOid(conversationId)) return false;
+
+  // The call must have been allocated by /calls/initiate and this exact sender
+  // and recipient must be its two parties. This prevents arbitrary user-room
+  // signaling and forged accept/end events.
+  try {
+    auto raw = pulse::cache().get("call:" + callId);
+    Json::Value call;
+    if (!raw || raw->empty() || !parseJson(*raw, call) ||
+        str(call, "callId") != callId ||
+        str(call, "conversationId") != conversationId) return false;
+    const std::string caller = str(call, "caller");
+    const std::string callee = str(call, "callee");
+    const bool validDirection =
+        (caller == st->userId && callee == to) ||
+        (callee == st->userId && caller == to);
+    if (!validDirection) return false;
+  } catch (...) {
+    return false;
+  }
+
+  Json::Value conversation =
+      getAuthorizedConversation(st->userId, conversationId);
+  if (conversation.isNull() || !hasParticipant(conversation, to)) return false;
 
   // Build the relayed payload: copy the client's fields but force `from` to the
   // authenticated sender (so the callee always sees who is really calling).
@@ -1251,6 +1464,7 @@ void RealtimeController::relayCallEvent(const WebSocketConnectionPtr& conn,
 
   // Deliver to every socket the recipient holds (their `user_<to>` room).
   emitRoom("user_" + to, events, payload);
+  return true;
 }
 
 // call_invite — A rings B. Rate-limited on the "presence" bucket (calls are
@@ -1261,12 +1475,6 @@ void RealtimeController::handleCallInvite(const WebSocketConnectionPtr& conn,
                                           std::int64_t ackId) {
   auto st = state(conn);
   if (!st) return;
-  if (!st->limiter.allow("presence", nowMs())) {
-    if (st->limiter.consumeWarn()) { Json::Value rl; rl["category"] = "presence"; emitTo(conn, "rate_limited", rl); }
-    Json::Value cb; cb["status"] = "error"; cb["message"] = "Rate limited";
-    ack(conn, ackId, cb);
-    return;
-  }
   const std::string to = str(data, "to");
   const std::string callId = str(data, "callId");
   if (to.empty() || !isValidOid(to) || callId.empty()) {
@@ -1275,8 +1483,11 @@ void RealtimeController::handleCallInvite(const WebSocketConnectionPtr& conn,
     return;
   }
   // incoming_call is what the callee listens for (matches the FCM data type).
-  relayCallEvent(conn, {"incoming_call", "incoming-call"}, data);
-  Json::Value cb; cb["status"] = "ok";
+  const bool relayed =
+      relayCallEvent(conn, {"incoming_call", "incoming-call"}, data);
+  Json::Value cb;
+  cb["status"] = relayed ? "ok" : "error";
+  if (!relayed) cb["message"] = "Call is not authorized or was rate limited";
   ack(conn, ackId, cb);
 }
 
@@ -1314,6 +1525,7 @@ void RealtimeController::handleCallEnd(const WebSocketConnectionPtr& conn,
 void RealtimeController::handleDisconnect(const WebSocketConnectionPtr& conn) {
   auto st = state(conn);
   if (!st) return;
+  if (!st->presenceRegistered.exchange(false)) return;
   try {
     bool wentOffline = pulse::presence().removeConnection(st->userId);
     if (wentOffline) notifyConversationPeers(conn, false);

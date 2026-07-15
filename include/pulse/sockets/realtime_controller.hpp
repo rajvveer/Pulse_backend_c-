@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -80,11 +81,16 @@ private:
 struct ConnState {
   std::string id;                         // process-unique connection id (NOT the pointer)
   std::string userId;                     // socket.userId
+  std::string accessToken;                 // revalidated while the socket lives
   Json::Value user;                       // socket.user (lightweight identity)
   std::set<std::string> rooms;            // socket.rooms (room names this conn is in)
   Json::Value senderProfile;              // socket._senderProfile (cached, lazy)
   bool hasSenderProfile = false;
   RealtimeLimiter limiter;                // createSocketLimiter(socket)
+  // Pair Redis presence bookkeeping with a successful registration and make
+  // teardown idempotent if a transport reports close more than once.
+  std::atomic<bool> presenceRegistered{false};
+  std::atomic<bool> closed{false};
   std::mutex mu;                          // guards rooms / senderProfile
 };
 
@@ -94,6 +100,7 @@ class RealtimeController
 public:
   RealtimeController();
   ~RealtimeController() override;
+  static void shutdownInfrastructure();
 
   void handleNewConnection(const drogon::HttpRequestPtr& req,
                            const drogon::WebSocketConnectionPtr& conn) override;
@@ -147,6 +154,8 @@ private:
   // ===== Redis pub/sub (cross-instance fan-out) =====
   void startSubscriber();
   void stopSubscriber();
+  void startAuthMonitor();
+  void stopAuthMonitor();
   // Publish one room delivery to peer instances. `excludeId` is the originating
   // connection's stable id so the publishing instance does not double-deliver.
   void publishRoom(const std::string& room, const std::string& frame,
@@ -200,7 +209,7 @@ private:
   // Common relay: forward a call control frame to the `to` user's room, stamping
   // `from` with the sender's id so the peer can't be spoofed. `extraEvents` lets
   // a single logical event ship under both underscore + hyphen aliases.
-  void relayCallEvent(const drogon::WebSocketConnectionPtr& conn,
+  bool relayCallEvent(const drogon::WebSocketConnectionPtr& conn,
                       const std::vector<std::string>& events,
                       const Json::Value& data);
 
@@ -239,9 +248,14 @@ private:
   std::shared_ptr<sw::redis::Redis> sub_;   // subscriber client
   std::thread subThread_;
   std::atomic<bool> subRunning_{false};
+  std::thread authThread_;
+  std::atomic<bool> authRunning_{false};
+  std::mutex authWaitMu_;
+  std::condition_variable authWaitCv_;
 
   // This instance's id, embedded in published frames so we can drop our own.
   std::string instanceId_;
+  static std::atomic<RealtimeController*> activeInstance_;
 };
 
 } // namespace pulse::sockets
