@@ -14,6 +14,7 @@
 // envelope, so responses are built with pulse::http::json directly.
 #include "pulse/controllers/push_controller.hpp"
 
+#include <cctype>
 #include <exception>
 #include <string>
 
@@ -34,6 +35,34 @@ using bld::kvp;
 using bld::make_document;
 
 namespace {
+
+constexpr std::size_t kMaxPushTokenBytes = 4096;
+constexpr std::size_t kMaxDeviceIdBytes = 200;
+
+bool containsWhitespaceOrControl(const std::string& value) {
+  for (const unsigned char ch : value) {
+    if (std::isspace(ch) || std::iscntrl(ch)) return true;
+  }
+  return false;
+}
+
+bool isValidPushToken(const std::string& token) {
+  return !token.empty() && token.size() <= kMaxPushTokenBytes &&
+         !containsWhitespaceOrControl(token);
+}
+
+bool isValidDeviceId(const std::string& deviceId) {
+  if (deviceId.empty() || deviceId.size() > kMaxDeviceIdBytes) return false;
+  for (const unsigned char ch : deviceId) {
+    if (std::iscntrl(ch)) return false;
+  }
+  return true;
+}
+
+bool isValidPlatform(const std::string& platform) {
+  return platform == "ios" || platform == "android" || platform == "web" ||
+         platform == "desktop";
+}
 
 // req.user.userId from the AuthFilter-populated attribute.
 std::string authedUserId(const drogon::HttpRequestPtr& req) {
@@ -93,12 +122,24 @@ void PushController::registerToken(
       callback(failure(drogon::k400BadRequest, "Token and deviceId are required"));
       return;
     }
+    if (!isValidPushToken(token)) {
+      callback(failure(drogon::k400BadRequest, "Invalid push token"));
+      return;
+    }
+    if (!isValidDeviceId(deviceId)) {
+      callback(failure(drogon::k400BadRequest, "Invalid deviceId"));
+      return;
+    }
 
     // platform || 'android' — falsy (missing/empty) falls back to 'android'.
     std::string platform =
         body.isMember("platform") && body["platform"].isString() ? body["platform"].asString()
                                                                  : "";
     if (platform.empty()) platform = "android";
+    if (!isValidPlatform(platform)) {
+      callback(failure(drogon::k400BadRequest, "Invalid platform"));
+      return;
+    }
 
     Json::Value result =
         pulse::PushService::instance().registerToken(userId, token, deviceId, platform);
@@ -106,16 +147,11 @@ void PushController::registerToken(
     if (result.isObject() && result.isMember("success") && result["success"].asBool()) {
       callback(successMsg(drogon::k200OK, "Push notification token registered"));
     } else {
-      // result.error || 'Failed to register token'
-      const std::string err =
-          (result.isObject() && result.isMember("error") && result["error"].isString())
-              ? result["error"].asString()
-              : "";
       callback(failure(drogon::k500InternalServerError,
-                       err.empty() ? "Failed to register token" : err));
+                       "Failed to register token"));
     }
-  } catch (const std::exception& e) {
-    pulse::log::error("Register push token error: {}", e.what());
+  } catch (const std::exception&) {
+    pulse::log::error("Register push token error");
     callback(failure(drogon::k500InternalServerError,
                      "Failed to register push notification token"));
   }
@@ -148,13 +184,17 @@ void PushController::unregisterToken(
       callback(failure(drogon::k400BadRequest, "deviceId is required"));
       return;
     }
+    if (!isValidDeviceId(deviceId)) {
+      callback(failure(drogon::k400BadRequest, "Invalid deviceId"));
+      return;
+    }
 
     // Result intentionally ignored, matching the JS (it always returns success).
     pulse::PushService::instance().unregisterToken(userId, deviceId);
 
     callback(successMsg(drogon::k200OK, "Push notification token unregistered"));
-  } catch (const std::exception& e) {
-    pulse::log::error("Unregister push token error: {}", e.what());
+  } catch (const std::exception&) {
+    pulse::log::error("Unregister push token error");
     callback(failure(drogon::k500InternalServerError,
                      "Failed to unregister push notification token"));
   }
@@ -216,8 +256,8 @@ void PushController::getStatus(
     body["success"] = true;
     body["data"] = std::move(data);
     callback(pulse::http::json(drogon::k200OK, std::move(body)));
-  } catch (const std::exception& e) {
-    pulse::log::error("Get push status error: {}", e.what());
+  } catch (const std::exception&) {
+    pulse::log::error("Get push status error");
     callback(failure(drogon::k500InternalServerError,
                      "Failed to get push notification status"));
   }

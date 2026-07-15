@@ -18,6 +18,7 @@
 // singleton). `initializeFirebase()` runs from the constructor, matching the
 // JS "Initialize on module load" call.
 #pragma once
+#include <mutex>
 #include <string>
 #include <optional>
 #include <json/json.h>
@@ -92,6 +93,7 @@ private:
   std::string privateKey_;   // PEM, with real newlines
 
   // Cached OAuth2 access token + its expiry (epoch seconds).
+  std::mutex  accessTokenMutex_;
   std::string cachedAccessToken_;
   long long   accessTokenExpiry_ = 0;
 };

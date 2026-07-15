@@ -11,6 +11,7 @@
 // thread, matching the conventions note that blocking DB/HTTP calls inside a
 // handler are acceptable on Drogon's thread pool).
 #include "pulse/services/push_service.hpp"
+#include "pulse/services/http_client.hpp"
 
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
@@ -35,8 +36,12 @@
 #include <mongocxx/collection.hpp>
 #include <mongocxx/options/find.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -87,6 +92,34 @@ long long nowSeconds() {
       .count();
 }
 
+constexpr std::size_t kMaxPushTokenBytes = 4096;
+constexpr std::size_t kMaxDeviceIdBytes = 200;
+constexpr std::int32_t kMaxRegisteredDevices = 20;
+
+bool containsWhitespaceOrControl(const std::string& value) {
+  for (const unsigned char ch : value) {
+    if (std::isspace(ch) || std::iscntrl(ch)) return true;
+  }
+  return false;
+}
+
+bool isValidRegistrationToken(const std::string& token) {
+  return !token.empty() && token.size() <= kMaxPushTokenBytes &&
+         !containsWhitespaceOrControl(token);
+}
+
+bool isValidDeviceId(const std::string& deviceId) {
+  if (deviceId.empty() || deviceId.size() > kMaxDeviceIdBytes) return false;
+  return std::none_of(deviceId.begin(), deviceId.end(), [](unsigned char ch) {
+    return std::iscntrl(ch) != 0;
+  });
+}
+
+bool isValidPlatform(const std::string& platform) {
+  return platform == "ios" || platform == "android" || platform == "web" ||
+         platform == "desktop";
+}
+
 } // namespace
 
 PushService& PushService::instance() {
@@ -124,8 +157,7 @@ void PushService::initializeFirebase() {
           return;
         }
       }
-      log::error("Firebase initialization error: could not load service account at {}",
-                 serviceAccountPath);
+      log::error("Firebase initialization error: could not load service account");
       return;
     }
 
@@ -144,7 +176,8 @@ void PushService::initializeFirebase() {
 
     log::warn("Firebase not configured - push notifications disabled");
   } catch (const std::exception& e) {
-    log::error("Firebase initialization error: {}", e.what());
+    (void)e;
+    log::error("Firebase initialization error");
   }
 }
 
@@ -181,7 +214,8 @@ Json::Value PushService::sendViaExpo(const std::string& expoPushToken,
     req->setContentTypeString("application/json");
     req->setBody(body);
 
-    auto [reqResult, resp] = client->sendRequest(req);
+    auto [reqResult, resp] = client->sendRequest(
+        req, pulse::services::outboundHttpTimeoutSeconds());
     if (reqResult != drogon::ReqResult::Ok || !resp) {
       log::error("Expo push request error");
       result["success"] = false;
@@ -192,12 +226,12 @@ Json::Value PushService::sendViaExpo(const std::string& expoPushToken,
     Json::Value parsed = parseJson(std::string(resp->getBody()));
     const Json::Value& rdata = parsed["data"];
     if (rdata.isObject() && rdata.get("status", "").asString() == "ok") {
-      log::info("Expo push sent: {}", rdata.get("id", "").asString());
+      log::info("Expo push sent");
       result["success"]   = true;
       result["messageId"] = rdata.get("id", Json::Value(Json::nullValue));
     } else if (rdata.isObject() && rdata.get("status", "").asString() == "error") {
       std::string msg = rdata.get("message", "").asString();
-      log::error("Expo push error: {}", msg);
+      log::error("Expo push rejected by provider");
       bool isInvalid =
           rdata.isMember("details") && rdata["details"].isObject() &&
           rdata["details"].get("error", "").asString() == "DeviceNotRegistered";
@@ -210,7 +244,7 @@ Json::Value PushService::sendViaExpo(const std::string& expoPushToken,
     }
     return result;
   } catch (const std::exception& e) {
-    log::error("Expo push error: {}", e.what());
+    log::error("Expo push error");
     result["success"] = false;
     result["error"]   = std::string(e.what());
     return result;
@@ -221,6 +255,11 @@ Json::Value PushService::sendViaExpo(const std::string& expoPushToken,
 // FCM (admin.messaging().send() equivalent)
 // ─────────────────────────────────────────────────────────────────────────
 std::string PushService::getAccessToken() {
+  // Serialize both the cache check and refresh. Besides eliminating data races
+  // on the cached string/expiry, this prevents a refresh stampede when several
+  // push sends notice an expired token at once.
+  std::lock_guard<std::mutex> lock(accessTokenMutex_);
+
   long long now = nowSeconds();
   if (!cachedAccessToken_.empty() && now < accessTokenExpiry_ - 60) {
     return cachedAccessToken_;
@@ -253,7 +292,8 @@ std::string PushService::getAccessToken() {
     req->setContentTypeString("application/x-www-form-urlencoded");
     req->setBody(formBody);
 
-    auto [reqResult, resp] = client->sendRequest(req);
+    auto [reqResult, resp] = client->sendRequest(
+        req, pulse::services::outboundHttpTimeoutSeconds());
     if (reqResult != drogon::ReqResult::Ok || !resp) {
       log::error("FCM token exchange request failed");
       return "";
@@ -262,15 +302,16 @@ std::string PushService::getAccessToken() {
     std::string token = parsed.get("access_token", "").asString();
     long long expiresIn = parsed.get("expires_in", 3600).asInt64();
     if (token.empty()) {
-      log::error("FCM token exchange returned no access_token: {}",
-                 std::string(resp->getBody()));
+      log::error("FCM token exchange returned no access token (status {})",
+                 static_cast<int>(resp->getStatusCode()));
       return "";
     }
     cachedAccessToken_  = token;
     accessTokenExpiry_  = now + expiresIn;
     return token;
   } catch (const std::exception& e) {
-    log::error("FCM token exchange error: {}", e.what());
+    (void)e;
+    log::error("FCM token exchange error");
     return "";
   }
 }
@@ -343,7 +384,8 @@ Json::Value PushService::sendViaFcm(const std::string& token,
     req->addHeader("Authorization", "Bearer " + accessToken);
     req->setBody(toCompactJson(envelope));
 
-    auto [reqResult, resp] = client->sendRequest(req);
+    auto [reqResult, resp] = client->sendRequest(
+        req, pulse::services::outboundHttpTimeoutSeconds());
     if (reqResult != drogon::ReqResult::Ok || !resp) {
       log::error("FCM push notification error: request failed");
       result["success"] = false;
@@ -355,7 +397,7 @@ Json::Value PushService::sendViaFcm(const std::string& token,
     int status = resp->getStatusCode();
     if (status >= 200 && status < 300 && parsed.isMember("name")) {
       std::string name = parsed["name"].asString();
-      log::info("FCM push notification sent: {}", name);
+      log::info("FCM push notification sent");
       result["success"]   = true;
       result["messageId"] = name;
       return result;
@@ -380,7 +422,7 @@ Json::Value PushService::sendViaFcm(const std::string& token,
         }
       }
     }
-    log::error("FCM push notification error: {}", errorMessage);
+    log::error("FCM push notification rejected (status {})", status);
     if (errorStatus == "UNREGISTERED" || errorStatus == "INVALID_ARGUMENT" ||
         errorStatus == "NOT_FOUND") {
       result["success"]      = false;
@@ -392,7 +434,7 @@ Json::Value PushService::sendViaFcm(const std::string& token,
     result["error"]   = errorMessage;
     return result;
   } catch (const std::exception& e) {
-    log::error("FCM push notification error: {}", e.what());
+    log::error("FCM push notification error");
     result["success"] = false;
     result["error"]   = std::string(e.what());
     return result;
@@ -496,8 +538,7 @@ Json::Value PushService::sendToUser(const std::string& userId,
               "fcmTokens",
               make_document(kvp("token", make_document(kvp("$in", inArr))))))));
       col.update_one(make_document(kvp("_id", *id)).view(), update.view());
-      log::info("Removed {} invalid FCM tokens for user {}", invalidTokens.size(),
-                userId);
+      log::info("Removed {} invalid FCM tokens", invalidTokens.size());
     }
 
     out["success"] = successCount > 0;
@@ -506,7 +547,7 @@ Json::Value PushService::sendToUser(const std::string& userId,
     out["results"] = results;
     return out;
   } catch (const std::exception& e) {
-    log::error("Send to user error: {}", e.what());
+    log::error("Send to user error");
     out["success"] = false;
     out["error"]   = std::string(e.what());
     return out;
@@ -521,6 +562,13 @@ Json::Value PushService::registerToken(const std::string& userId,
                                        const std::string& deviceId,
                                        const std::string& platform) {
   Json::Value out(Json::objectValue);
+  if (!isValidRegistrationToken(token) || !isValidDeviceId(deviceId) ||
+      !isValidPlatform(platform)) {
+    out["success"] = false;
+    out["error"] = "Invalid push token registration";
+    return out;
+  }
+
   try {
     auto id = bsonjson::oid(userId);  // throws if invalid (caught below)
     auto col = db::collection(models::user::kCollection);
@@ -547,26 +595,35 @@ Json::Value PushService::registerToken(const std::string& userId,
       col.update_one(make_document(kvp("_id", id)).view(), update.view());
     }
 
-    // 3) Add/push the new token:
-    // User.findByIdAndUpdate(userId, { $push: { fcmTokens: { token, deviceId, platform, lastUsed: new Date() } } })
+    // 3) Add the new token at the front and cap retained devices. `$slice`
+    // executes as part of the atomic push, so concurrent registrations cannot
+    // grow the array beyond the configured bound.
     {
       bsoncxx::types::b_date now{std::chrono::milliseconds(bsonjson::nowMillis())};
+      bld::array each;
+      each.append(make_document(kvp("token", token), kvp("deviceId", deviceId),
+                                kvp("platform", platform), kvp("lastUsed", now)));
       auto update = make_document(kvp(
           "$push",
           make_document(kvp(
               "fcmTokens",
-              make_document(kvp("token", token), kvp("deviceId", deviceId),
-                            kvp("platform", platform), kvp("lastUsed", now))))));
-      col.update_one(make_document(kvp("_id", id)).view(), update.view());
+              make_document(kvp("$each", each), kvp("$position", 0),
+                            kvp("$slice", kMaxRegisteredDevices))))));
+      auto result = col.update_one(make_document(kvp("_id", id)).view(), update.view());
+      if (!result || result->matched_count() != 1) {
+        out["success"] = false;
+        out["error"] = "User not found";
+        return out;
+      }
     }
 
-    log::info("FCM token registered for user {}", userId);
+    log::info("Push token registered");
     out["success"] = true;
     return out;
-  } catch (const std::exception& e) {
-    log::error("Register token error: {}", e.what());
+  } catch (const std::exception&) {
+    log::error("Register token error");
     out["success"] = false;
-    out["error"]   = std::string(e.what());
+    out["error"]   = "Failed to register token";
     return out;
   }
 }
@@ -577,6 +634,12 @@ Json::Value PushService::registerToken(const std::string& userId,
 Json::Value PushService::unregisterToken(const std::string& userId,
                                          const std::string& deviceId) {
   Json::Value out(Json::objectValue);
+  if (!isValidDeviceId(deviceId)) {
+    out["success"] = false;
+    out["error"] = "Invalid deviceId";
+    return out;
+  }
+
   try {
     auto id = bsonjson::oid(userId);
     auto col = db::collection(models::user::kCollection);
@@ -587,13 +650,13 @@ Json::Value PushService::unregisterToken(const std::string& userId,
                                        make_document(kvp("deviceId", deviceId))))));
     col.update_one(make_document(kvp("_id", id)).view(), update.view());
 
-    log::info("FCM token unregistered for user {}", userId);
+    log::info("Push token unregistered");
     out["success"] = true;
     return out;
-  } catch (const std::exception& e) {
-    log::error("Unregister token error: {}", e.what());
+  } catch (const std::exception&) {
+    log::error("Unregister token error");
     out["success"] = false;
-    out["error"]   = std::string(e.what());
+    out["error"]   = "Failed to unregister token";
     return out;
   }
 }
