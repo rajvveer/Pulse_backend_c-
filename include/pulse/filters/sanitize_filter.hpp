@@ -25,6 +25,11 @@ Json::Value deepSanitize(const Json::Value& v);
 namespace pulse::filters {
 using namespace drogon;
 
+// Parse, bound, sanitize, and replace an application/json request body before
+// controllers call getJsonObject(). Returns false and fills `response` when the
+// body is invalid or exceeds configured JSON/sanitization limits.
+bool sanitizeJsonRequest(const HttpRequestPtr& req, HttpResponsePtr& response);
+
 class SanitizeFilter : public HttpFilter<SanitizeFilter> {
 public:
   void doFilter(const HttpRequestPtr&, FilterCallback&&, FilterChainCallback&&) override;
