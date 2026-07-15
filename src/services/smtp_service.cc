@@ -6,6 +6,7 @@
 // transactional-email HTTP API (POST https://api.brevo.com/v3/smtp/email) via
 // Drogon's HttpClient. Behavior, env keys, and log messages mirror the JS source.
 #include "pulse/services/smtp_service.hpp"
+#include "pulse/services/http_client.hpp"
 
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
@@ -41,7 +42,7 @@ drogon::HttpResponsePtr sendHttpSync(const std::string& baseUrl,
   client->sendRequest(
       req, [&prom](drogon::ReqResult r, const drogon::HttpResponsePtr& resp) {
         prom.set_value({r, resp});
-      });
+      }, pulse::services::outboundHttpTimeoutSeconds());
   auto [result, resp] = fut.get();
   loop->quit();
   if (result != drogon::ReqResult::Ok) {
@@ -131,8 +132,8 @@ Json::Value SMTPConfig::sendMail(const MailOptions& mailOptions) {
 
   try {
     Json::Value info = sendBrevoEmail(mailOptions);
-    // JS: console.log(`Email sent successfully to ${mailOptions.to}`).
-    pulse::log::info("\xE2\x9C\x85 Email sent successfully to {}", mailOptions.to);
+    // Do not put recipient addresses in process logs.
+    pulse::log::info("\xE2\x9C\x85 Email sent successfully");
     return info;
   } catch (const SmtpError& err) {
     // JS: console.error + reject(err).

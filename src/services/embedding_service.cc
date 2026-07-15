@@ -5,6 +5,7 @@
 // extractTopics). Preserves DIM=34, the block layout, L2 normalization, the
 // OpenAI semantic-embed call shape, and every field name the JS read.
 #include "pulse/services/embedding_service.hpp"
+#include "pulse/services/http_client.hpp"
 
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
@@ -507,7 +508,8 @@ std::optional<std::vector<double>> EmbeddingService::semanticEmbed(const std::st
       req->addHeader("Authorization", "Bearer " + apiKey);
       req->setContentTypeCode(drogon::CT_APPLICATION_JSON);
 
-      auto [result, resp] = client->sendRequest(req);
+      auto [result, resp] = client->sendRequest(
+          req, pulse::services::outboundHttpTimeoutSeconds());
       if (result != drogon::ReqResult::Ok || !resp) return std::nullopt;
 
       const auto json = resp->getJsonObject();

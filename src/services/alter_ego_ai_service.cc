@@ -5,6 +5,7 @@
 // built/parsed with JsonCpp (Json::Value) to mirror the JS request/response
 // shapes exactly.
 #include "pulse/services/alter_ego_ai_service.hpp"
+#include "pulse/services/http_client.hpp"
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
 
@@ -207,7 +208,8 @@ std::string AlterEgoAIService::callGemini(const std::string& systemPrompt,
   req->addHeader("Content-Type", "application/json");
   req->setBody(toJsonString(body));
 
-  auto result = client->sendRequest(req);
+  auto result = client->sendRequest(
+      req, pulse::services::outboundHttpTimeoutSeconds());
   if (result.first != drogon::ReqResult::Ok || !result.second) {
     throw std::runtime_error("Gemini API error: request failed");
   }
@@ -290,7 +292,8 @@ std::string AlterEgoAIService::callOpenAI(const std::string& systemPrompt,
   req->addHeader("Authorization", "Bearer " + cfg_.openaiApiKey);
   req->setBody(toJsonString(body));
 
-  auto result = client->sendRequest(req);
+  auto result = client->sendRequest(
+      req, pulse::services::outboundHttpTimeoutSeconds());
   if (result.first != drogon::ReqResult::Ok || !result.second) {
     throw std::runtime_error("OpenAI API error: request failed");
   }

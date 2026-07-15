@@ -8,15 +8,19 @@
 
 #include <drogon/HttpClient.h>
 
+#include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <cstdio>
 #include <future>
 #include <string>
+#include <system_error>
 #include <utility>
 
 #include "pulse/config.hpp"
 #include "pulse/http_response.hpp"
 #include "pulse/logger.hpp"
+#include "pulse/services/http_client.hpp"
 
 using namespace pulse::controllers;
 
@@ -56,27 +60,14 @@ bool ensureConfigured(const std::function<void(const drogon::HttpResponsePtr&)>&
   return false;
 }
 
-// parseInt(limit) — parse a leading optional sign + digits, JS-style. Returns
-// the canonical string form so the query param matches axios serialization
-// (NaN serializes to the literal "NaN").
-std::string parseIntJs(const std::string& s) {
-  size_t i = 0;
-  while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' ||
-                          s[i] == '\r' || s[i] == '\f' || s[i] == '\v')) {
-    ++i;
-  }
-  std::string out;
-  if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-    if (s[i] == '-') out.push_back('-');
-    ++i;
-  }
-  size_t digitsStart = out.size();
-  while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
-    out.push_back(s[i]);
-    ++i;
-  }
-  if (out.size() == digitsStart) return "NaN";  // no digits consumed
-  return out;
+// Tenor accepts at most 50 results. Invalid values fall back to the API default
+// rather than being forwarded as an unbounded or nonsensical parameter.
+std::string boundedLimit(const std::string& s) {
+  if (s.empty()) return "20";
+  int value = 0;
+  const auto parsed = std::from_chars(s.data(), s.data() + s.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != s.data() + s.size()) return "20";
+  return std::to_string(std::clamp(value, 1, 50));
 }
 
 // trim helper (JS .trim()).
@@ -121,7 +112,7 @@ TenorResult tenorGet(const std::string& subPath,
     client->sendRequest(
         req, [&prom](drogon::ReqResult rr, const drogon::HttpResponsePtr& resp) {
           prom.set_value({rr, resp});
-        });
+        }, pulse::services::outboundHttpTimeoutSeconds());
     auto [rr, resp] = fut.get();
 
     if (rr != drogon::ReqResult::Ok || !resp) return result;  // axios throws
@@ -197,20 +188,24 @@ void GifController::searchGifs(const HttpRequestPtr& req,
   try {
     // const { q, limit = 20 } = req.query;
     std::string q = req->getParameter("q");
-    std::string limitParam = req->getParameter("limit");
-    std::string limit = limitParam.empty() ? std::string("20") : limitParam;
+    const std::string limit = boundedLimit(req->getParameter("limit"));
 
     // if (!q || !q.trim()) -> 400 { success:false, message:'Search query is required' }
-    if (trim(q).empty()) {
+    q = trim(q);
+    if (q.empty()) {
       callback(messageResponse(drogon::k400BadRequest, "Search query is required"));
+      return;
+    }
+    if (q.size() > 200) {
+      callback(messageResponse(drogon::k400BadRequest, "Search query is too long"));
       return;
     }
 
     auto resp = tenorGet("/search", {
-                                        {"q", trim(q)},
+                                        {"q", q},
                                         {"key", tenorApiKey()},
                                         {"client_key", tenorClientKey()},
-                                        {"limit", parseIntJs(limit)},
+                                        {"limit", limit},
                                         {"media_filter", "gif,tinygif"},
                                         {"contentfilter", "medium"},
                                     });
@@ -239,13 +234,12 @@ void GifController::getTrendingGifs(const HttpRequestPtr& req,
   if (!ensureConfigured(callback)) return;
   try {
     // const { limit = 20 } = req.query;
-    std::string limitParam = req->getParameter("limit");
-    std::string limit = limitParam.empty() ? std::string("20") : limitParam;
+    const std::string limit = boundedLimit(req->getParameter("limit"));
 
     auto resp = tenorGet("/featured", {
                                           {"key", tenorApiKey()},
                                           {"client_key", tenorClientKey()},
-                                          {"limit", parseIntJs(limit)},
+                                          {"limit", limit},
                                           {"media_filter", "gif,tinygif"},
                                           {"contentfilter", "medium"},
                                       });
