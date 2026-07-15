@@ -143,27 +143,8 @@ void emitEvent(const drogon::WebSocketConnectionPtr& conn, const std::string& ev
 // limiter + pub/sub, and joins the user's room user_<id>. Self-registers via
 // WS_PATH_LIST. The chat event routing (send_message, typing, ...) lives in the
 // realtime unit, which reads the SocketContext placed here.
-class SocketRateLimitController
-    : public drogon::WebSocketController<SocketRateLimitController> {
-public:
-  void handleNewConnection(const drogon::HttpRequestPtr& req,
-                           const drogon::WebSocketConnectionPtr& conn) override;
-
-  void handleNewMessage(const drogon::WebSocketConnectionPtr& conn,
-                        std::string&& message,
-                        const drogon::WebSocketMessageType& type) override;
-
-  void handleConnectionClosed(
-      const drogon::WebSocketConnectionPtr& conn) override;
-
-  WS_PATH_LIST_BEGIN
-  // NOTE: the primary realtime endpoint (chat + presence) lives at /ws in the
-  // realtime controller, which embeds this limiter via SocketContext. This unit
-  // is the standalone socketRateLimit.js port; it mounts its own endpoint on a
-  // DISTINCT path so the two WebSocketControllers never contend for the same
-  // route. A client connecting here is authenticated + rate-limited identically.
-  WS_PATH_ADD("/ws/ratelimit");
-  WS_PATH_LIST_END
-};
+// The historical `/ws/ratelimit` controller was a no-op message sink and is
+// intentionally not registered. Clients use the authenticated `/ws` or
+// `/ws/presence` endpoints; this file only supplies reusable limiter utilities.
 
 } // namespace pulse::sockets

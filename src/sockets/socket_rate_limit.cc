@@ -6,11 +6,6 @@
 // JS source. The only event this unit emits is `rate_limited` { category }.
 #include "pulse/sockets/socket_rate_limit.hpp"
 
-#include "pulse/cache.hpp"
-#include "pulse/jwt_service.hpp"
-#include "pulse/logger.hpp"
-
-#include <sw/redis++/redis++.h>
 #include <json/json.h>
 
 #include <algorithm>
@@ -185,78 +180,6 @@ void RoomRegistry::emitToRoomExcept(const std::string& room, const std::string& 
     if (it->second.empty()) rooms_.erase(it);
   }
   for (const auto& c : targets) emitEvent(c, event, payloadJson);
-}
-
-// ── Handshake auth (ports server.js io.use + io.on('connection')) ────────────
-namespace {
-// Token from the `token` query param OR the Authorization: Bearer header.
-// (Socket.IO read socket.handshake.auth.token; native WS clients send it as a
-//  query param or header instead.)
-std::string handshakeToken(const HttpRequestPtr& req) {
-  std::string token = req->getParameter("token");
-  if (!token.empty()) return token;
-  std::string h = req->getHeader("authorization");
-  if (h.rfind("Bearer ", 0) == 0) return h.substr(7);
-  return "";
-}
-} // namespace
-
-void SocketRateLimitController::handleNewConnection(
-    const HttpRequestPtr& req, const WebSocketConnectionPtr& conn) {
-  // ✅ Socket Authentication — reject connections without a valid JWT (same
-  // verification path as REST: pinned algorithm, issuer, audience, token type;
-  // a refresh or temp token cannot open a socket).
-  std::string token = handshakeToken(req);
-  if (token.empty()) {
-    log::warn("\xE2\x9B\x94 Socket connection rejected \xE2\x80\x94 no auth token provided");
-    conn->shutdown(CloseCode::kViolation, "Authentication required");
-    return;
-  }
-
-  auto ctx = std::make_shared<SocketContext>();
-  try {
-    auto decoded = pulse::jwt().verifyAccessToken(token);
-    ctx->userId = decoded.userId;
-  } catch (const std::exception& err) {
-    log::warn("\xE2\x9B\x94 Socket connection rejected \xE2\x80\x94 {}", err.what());
-    conn->shutdown(CloseCode::kViolation,
-                   std::string("Authentication failed: ") + err.what());
-    return;
-  }
-
-  // Dedicated Redis client for pub/sub (Socket.IO redis-adapter analogue), so
-  // cross-worker broadcasts can be wired by the realtime layer. Best-effort.
-  try {
-    ctx->pubsub = pulse::cache().createClient();
-  } catch (...) {
-    ctx->pubsub = nullptr;  // adapter half-works without it, like the JS path
-  }
-
-  conn->setContext(ctx);
-
-  // Always join the user's own room so server-side code can target a specific
-  // user (notifications, etc.) regardless of which worker they're on.
-  RoomRegistry::instance().join("user_" + ctx->userId, conn);
-}
-
-void SocketRateLimitController::handleNewMessage(
-    const WebSocketConnectionPtr& conn, std::string&& message,
-    const WebSocketMessageType& type) {
-  // This unit owns only the rate-limit + room scaffold; chat event routing
-  // (send_message, typing, ...) lives in the realtime unit, which reads the
-  // SocketContext set here and calls ctx->limiter.guard(category) per handler.
-  // No-op here keeps the limiter/room semantics isolated and testable.
-  (void)conn;
-  (void)message;
-  (void)type;
-}
-
-void SocketRateLimitController::handleConnectionClosed(
-    const WebSocketConnectionPtr& conn) {
-  // Drop the socket from every room. The per-socket buckets live in the
-  // SocketContext and are discarded with it when the framework releases the
-  // connection — exactly the JS "bucket is discarded on disconnect" behaviour.
-  RoomRegistry::instance().leaveAll(conn);
 }
 
 } // namespace pulse::sockets
