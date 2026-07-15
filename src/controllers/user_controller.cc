@@ -15,9 +15,11 @@
 #include "pulse/bson_json.hpp"
 #include "pulse/logger.hpp"
 #include "pulse/http_response.hpp"
+#include "pulse/jwt_service.hpp"
 #include "pulse/models/user.hpp"
 #include "pulse/models/post.hpp"
 #include "pulse/models/follow.hpp"
+#include "pulse/models/session.hpp"
 #include "pulse/models/notification.hpp"
 #include "pulse/services/embedding_service.hpp"
 #include "pulse/services/user_vector_service.hpp"
@@ -35,9 +37,13 @@
 #include <mongocxx/cursor.hpp>
 
 #include <pulse_bcrypt.h>
+#include <openssl/sha.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -80,6 +86,20 @@ std::string authUserId(const drogon::HttpRequestPtr& req) {
   return u.isObject() ? u.get("userId", "").asString() : "";
 }
 
+std::string sha256Hex(const std::string& value) {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(reinterpret_cast<const unsigned char*>(value.data()), value.size(), digest);
+  std::ostringstream out;
+  for (unsigned char byte : digest)
+    out << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+  return out.str();
+}
+
+std::string bearerToken(const drogon::HttpRequestPtr& req) {
+  const std::string header = req->getHeader("authorization");
+  return header.rfind("Bearer ", 0) == 0 ? header.substr(7) : "";
+}
+
 // escapeRegex(str) — mirrors src/utils/escapeRegex.js:
 //   String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 std::string escapeRegex(const std::string& in) {
@@ -101,6 +121,13 @@ std::string trim(const std::string& s) {
   while (b < e && isWs(s[b])) ++b;
   while (e > b && isWs(s[e - 1])) --e;
   return s.substr(b, e - b);
+}
+
+size_t utf8Length(const std::string& s) {
+  size_t length = 0;
+  for (unsigned char c : s)
+    if ((c & 0xc0) != 0x80) ++length;
+  return length;
 }
 
 // parseInt-like: JS parseInt(req.query.x) || fallback. Parses a leading integer;
@@ -146,6 +173,58 @@ bsoncxx::document::value listUserProjection() {
                        kvp("profile.avatar", 1),
                        kvp("avatar", 1),
                        kvp("isVerified", 1));
+}
+
+// Build an allowlisted profile response. Never spread the stored user document
+// into a public response: it also contains authentication, session, location,
+// moderation and device fields that were never intended for other users.
+Json::Value publicProfile(const Json::Value& user, bool isOwnProfile,
+                          bool isFollowing) {
+  Json::Value out(Json::objectValue);
+  const auto copy = [&](const char* key) {
+    if (user.isMember(key)) out[key] = user[key];
+  };
+  copy("_id");
+  copy("username");
+  copy("name");
+  copy("avatar");
+  copy("isVerified");
+
+  const Json::Value privacy = user.isMember("privacy") && user["privacy"].isObject()
+                                  ? user["privacy"]
+                                  : Json::Value(Json::objectValue);
+  const bool isPrivate = privacy.get("isPrivate", false).asBool();
+  const bool maySeeDetails = isOwnProfile || isFollowing || !isPrivate;
+
+  Json::Value publicPrivacy(Json::objectValue);
+  publicPrivacy["isPrivate"] = isPrivate;
+  if (privacy.isMember("allowMessages"))
+    publicPrivacy["allowMessages"] = privacy["allowMessages"];
+  if (privacy.isMember("allowTagging"))
+    publicPrivacy["allowTagging"] = privacy["allowTagging"];
+  out["privacy"] = std::move(publicPrivacy);
+
+  Json::Value profile(Json::objectValue);
+  if (user.isMember("profile") && user["profile"].isObject()) {
+    const Json::Value& stored = user["profile"];
+    for (const char* key : {"displayName", "avatar", "coverPhoto"}) {
+      if (stored.isMember(key)) profile[key] = stored[key];
+    }
+    if (maySeeDetails) {
+      for (const char* key : {"bio", "website"}) {
+        if (stored.isMember(key)) profile[key] = stored[key];
+      }
+      if (privacy.get("showLocation", true).asBool() && stored.isMember("location"))
+        profile["location"] = stored["location"];
+    }
+  }
+  out["profile"] = std::move(profile);
+
+  if (maySeeDetails && privacy.get("showOnlineStatus", true).asBool()) {
+    copy("isOnline");
+    copy("lastActive");
+  }
+  return out;
 }
 
 // Hydrate a list of follow docs' `<refField>` (follower/following ref) into the
@@ -356,10 +435,19 @@ void UserController::getUserByUsername(
 
     auto col = pulse::db::collection(pulse::models::user::kCollection);
     mongocxx::options::find opts;
-    // .select('-passwordHash -authMethods -email -phone')
-    opts.projection(make_document(kvp("passwordHash", 0), kvp("authMethods", 0),
-                                  kvp("email", 0), kvp("phone", 0)));
-    auto found = col.find_one(make_document(kvp("username", username)), opts);
+    // Inclusion projection is deliberate: newly-added private schema fields do
+    // not silently become public through this endpoint.
+    opts.projection(make_document(
+        kvp("username", 1), kvp("name", 1), kvp("avatar", 1),
+        kvp("profile.displayName", 1), kvp("profile.bio", 1),
+        kvp("profile.avatar", 1), kvp("profile.coverPhoto", 1),
+        kvp("profile.website", 1), kvp("profile.location", 1),
+        kvp("isVerified", 1), kvp("isOnline", 1), kvp("lastActive", 1),
+        kvp("privacy.isPrivate", 1), kvp("privacy.showLocation", 1),
+        kvp("privacy.showOnlineStatus", 1), kvp("privacy.allowMessages", 1),
+        kvp("privacy.allowTagging", 1)));
+    auto found = col.find_one(
+        make_document(kvp("username", username), kvp("isActive", true)), opts);
     if (!found) {
       callback(errMessage(drogon::k404NotFound, "User not found"));
       return;
@@ -367,7 +455,7 @@ void UserController::getUserByUsername(
     Json::Value user = pulse::bsonjson::toJson(found->view());
     const std::string targetId = user.get("_id", "").asString();
 
-    bool isFollowing        = pulse::models::follow::isFollowing(currentUserId, targetId);
+    bool isFollowing         = pulse::models::follow::isFollowing(currentUserId, targetId);
     long long followerCount  = pulse::models::follow::getFollowerCount(targetId);
     long long followingCount = pulse::models::follow::getFollowingCount(targetId);
 
@@ -383,7 +471,7 @@ void UserController::getUserByUsername(
     bool isOwnProfile = targetId == currentUserId;
 
     // data: { ...user, stats:{posts,followers,following}, isFollowing, isOwnProfile }
-    Json::Value data = user;
+    Json::Value data = publicProfile(user, isOwnProfile, isFollowing);
     Json::Value newStats(Json::objectValue);
     newStats["posts"]     = (Json::Int64)postCount;
     newStats["followers"] = (Json::Int64)followerCount;
@@ -410,7 +498,10 @@ void UserController::getUserPosts(
     const std::string currentUserId = authUserId(req);  // req.user?.userId
 
     auto users = pulse::db::collection(pulse::models::user::kCollection);
-    auto found = users.find_one(make_document(kvp("username", username)));
+    mongocxx::options::find userOpts;
+    userOpts.projection(make_document(kvp("privacy.isPrivate", 1)));
+    auto found = users.find_one(
+        make_document(kvp("username", username), kvp("isActive", true)), userOpts);
     if (!found) {
       auto resp = errMessage(drogon::k404NotFound, "User not found");
       resp->addHeader("Cache-Control", "no-store");
@@ -420,28 +511,45 @@ void UserController::getUserPosts(
     Json::Value user = pulse::bsonjson::toJson(found->view());
     const std::string targetId = user.get("_id", "").asString();
     auto targetOid = pulse::bsonjson::tryOid(targetId);
+    if (!targetOid) {
+      auto resp = errMessage(drogon::k404NotFound, "User not found");
+      resp->addHeader("Cache-Control", "no-store");
+      callback(resp);
+      return;
+    }
 
     bool isOwnProfile = !currentUserId.empty() && targetId == currentUserId;
+    bool followsTarget = !isOwnProfile &&
+        pulse::models::follow::isFollowing(currentUserId, targetId);
 
     // query = { author: user._id, isActive: true [, isAnonymous:false] }
     bld::document query;
-    if (targetOid) query.append(kvp("author", *targetOid));
+    query.append(kvp("author", *targetOid));
     query.append(kvp("isActive", true));
-    if (!isOwnProfile) query.append(kvp("isAnonymous", false));
+    if (!isOwnProfile) {
+      query.append(kvp("isAnonymous", false));
+      if (followsTarget) {
+        query.append(kvp("visibility", make_document(
+            kvp("$in", make_array("public", "followers")))));
+      } else {
+        query.append(kvp("visibility", "public"));
+      }
+    }
 
-    int page  = std::max(parseIntOr(req->getParameter("page"), 1), 1);
+    int page  = std::min(std::max(parseIntOr(req->getParameter("page"), 1), 1), 10000);
     int limit = std::min(std::max(parseIntOr(req->getParameter("limit"), 20), 1), 100);
 
     auto postsCol = pulse::db::collection(pulse::models::post::kCollection);
     mongocxx::options::find opts;
     opts.sort(make_document(kvp("createdAt", -1)));
-    opts.skip((page - 1) * limit);
+    opts.skip(static_cast<std::int64_t>(page - 1) * limit);
     opts.limit(limit);
 
     std::vector<Json::Value> posts;
     auto queryVal = query.extract();
     for (auto&& doc : postsCol.find(queryVal.view(), opts))
-      posts.push_back(pulse::bsonjson::toJson(doc));
+      posts.push_back(pulse::models::post::sanitizeForOutput(
+          pulse::bsonjson::toJson(doc)));
 
     // .populate('author', 'username name avatar profile')  — NO isVerified/stats.
     if (!posts.empty()) {
@@ -464,7 +572,9 @@ void UserController::getUserPosts(
         auto filter = make_document(kvp("_id", make_document(kvp("$in", in.extract()))));
         mongocxx::options::find aopts;
         aopts.projection(make_document(kvp("username", 1), kvp("name", 1),
-                                       kvp("avatar", 1), kvp("profile", 1)));
+                                       kvp("avatar", 1),
+                                       kvp("profile.displayName", 1),
+                                       kvp("profile.avatar", 1)));
         for (auto&& doc : users.find(filter.view(), aopts)) {
           Json::Value u = pulse::bsonjson::toJson(doc);
           if (u.isMember("_id") && u["_id"].isString()) byId[u["_id"].asString()] = u;
@@ -588,14 +698,80 @@ void UserController::updateProfile(
     auto bodyJson = req->getJsonObject();
     Json::Value body = bodyJson ? *bodyJson : Json::Value(Json::objectValue);
 
-    // updates {} keyed by dotted path; auto-sync avatar <-> profile.avatar.
+    static const std::unordered_set<std::string> booleanFields = {
+        "settings.pushNotifications", "settings.emailNotifications",
+        "settings.notifyOnLike", "settings.notifyOnComment",
+        "settings.notifyOnFollow", "settings.notifyOnMention",
+        "settings.shareExactLocation", "settings.anonymousPosting",
+        "privacy.isPrivate", "privacy.showOnlineStatus",
+        "privacy.showEmail", "privacy.showPhone", "privacy.showLocation",
+        "privacy.allowTagging"};
+
+    // Validate against the schema before constructing the dotted $set update.
     Json::Value updates(Json::objectValue);
     if (body.isObject()) {
       for (const auto& key : body.getMemberNames()) {
         if (std::find(allowedFields.begin(), allowedFields.end(), key) != allowedFields.end()) {
-          updates[key] = body[key];
-          if (key == "profile.avatar") updates["avatar"] = body[key];
-          if (key == "avatar") updates["profile.avatar"] = body[key];
+          Json::Value value = body[key];
+
+          if (key.rfind("profile.", 0) == 0 || key == "avatar") {
+            if (!value.isString()) {
+              callback(errMessage(drogon::k400BadRequest,
+                                  key + " must be a string"));
+              return;
+            }
+            std::string text = value.asString();
+            size_t maxLength = 2048;
+            if (key == "profile.displayName") {
+              text = trim(text);
+              maxLength = 50;
+            } else if (key == "profile.bio") {
+              maxLength = 150;
+            } else if (key == "profile.location" || key == "profile.website") {
+              maxLength = 100;
+            }
+            if (utf8Length(text) > maxLength) {
+              callback(errMessage(drogon::k400BadRequest,
+                                  key + " exceeds its maximum length"));
+              return;
+            }
+            value = text;
+          } else if (booleanFields.count(key) != 0) {
+            if (!value.isBool()) {
+              callback(errMessage(drogon::k400BadRequest,
+                                  key + " must be a boolean"));
+              return;
+            }
+          } else if (key == "settings.radius") {
+            if (!value.isNumeric() || !std::isfinite(value.asDouble()) ||
+                value.asDouble() < 100.0 || value.asDouble() > 50000.0) {
+              callback(errMessage(drogon::k400BadRequest,
+                                  "settings.radius must be between 100 and 50000"));
+              return;
+            }
+          } else if (key == "settings.theme") {
+            if (!value.isString() ||
+                (value.asString() != "light" && value.asString() != "dark" &&
+                 value.asString() != "auto")) {
+              callback(errMessage(drogon::k400BadRequest,
+                                  "settings.theme must be light, dark, or auto"));
+              return;
+            }
+          } else if (key == "privacy.allowMessages") {
+            if (!value.isString() ||
+                (value.asString() != "everyone" &&
+                 value.asString() != "followers" &&
+                 value.asString() != "none")) {
+              callback(errMessage(
+                  drogon::k400BadRequest,
+                  "privacy.allowMessages must be everyone, followers, or none"));
+              return;
+            }
+          }
+
+          updates[key] = value;
+          if (key == "profile.avatar") updates["avatar"] = value;
+          if (key == "avatar") updates["profile.avatar"] = value;
         }
       }
     }
@@ -714,8 +890,8 @@ void UserController::getFollowers(
     std::function<void(const drogon::HttpResponsePtr&)>&& callback,
     std::string username) {
   try {
-    int page  = parseIntOr(req->getParameter("page"), 1);
-    int limit = parseIntOr(req->getParameter("limit"), 20);
+    int page  = std::min(std::max(parseIntOr(req->getParameter("page"), 1), 1), 10000);
+    int limit = std::min(std::max(parseIntOr(req->getParameter("limit"), 20), 1), 100);
 
     auto users = pulse::db::collection(pulse::models::user::kCollection);
     mongocxx::options::find idOnly;
@@ -734,7 +910,7 @@ void UserController::getFollowers(
     if (targetOid) ff.append(kvp("following", *targetOid));
     mongocxx::options::find opts;
     opts.sort(make_document(kvp("createdAt", -1)));
-    opts.skip((page - 1) * limit);
+    opts.skip(static_cast<std::int64_t>(page - 1) * limit);
     opts.limit(limit);
 
     std::vector<Json::Value> followDocs;
@@ -759,8 +935,8 @@ void UserController::getFollowing(
     std::function<void(const drogon::HttpResponsePtr&)>&& callback,
     std::string username) {
   try {
-    int page  = parseIntOr(req->getParameter("page"), 1);
-    int limit = parseIntOr(req->getParameter("limit"), 20);
+    int page  = std::min(std::max(parseIntOr(req->getParameter("page"), 1), 1), 10000);
+    int limit = std::min(std::max(parseIntOr(req->getParameter("limit"), 20), 1), 100);
 
     auto users = pulse::db::collection(pulse::models::user::kCollection);
     mongocxx::options::find idOnly;
@@ -779,7 +955,7 @@ void UserController::getFollowing(
     if (targetOid) ff.append(kvp("follower", *targetOid));
     mongocxx::options::find opts;
     opts.sort(make_document(kvp("createdAt", -1)));
-    opts.skip((page - 1) * limit);
+    opts.skip(static_cast<std::int64_t>(page - 1) * limit);
     opts.limit(limit);
 
     std::vector<Json::Value> followDocs;
@@ -844,9 +1020,20 @@ void UserController::changePassword(
     }
 
     std::string newHash = bcryptHash(newPassword);
-    if (oid)
+    if (oid) {
+      // Invalidate every refresh session before committing the new password.
+      // Existing devices must authenticate again instead of silently refreshing.
+      pulse::models::session::deactivateUserSessions(*oid);
       col.update_one(make_document(kvp("_id", *oid)),
-                     make_document(kvp("$set", make_document(kvp("passwordHash", newHash)))));
+                     make_document(kvp("$set", make_document(
+                         kvp("passwordHash", newHash), kvp("updatedAt", nowDate())))));
+      pulse::cache().del("auth_user:" + userId);
+      const std::string accessToken = bearerToken(req);
+      if (!accessToken.empty()) {
+        pulse::cache().set("revoked_token:" + sha256Hex(accessToken), "1",
+                           pulse::jwt().accessTokenTtlSeconds());
+      }
+    }
 
     callback(okMessage("Password updated successfully"));
   } catch (const std::exception& e) {
@@ -898,6 +1085,13 @@ void UserController::deleteAccount(
       col.update_one(make_document(kvp("_id", *oid)),
                      make_document(kvp("$set", setDoc.extract()),
                                    kvp("$unset", unsetDoc.extract())));
+
+    if (oid) pulse::models::session::deactivateUserSessions(*oid);
+    // AuthFilter caches account activity; evict it immediately so an already
+    // issued access token cannot ride a stale "true" value for five minutes.
+    pulse::cache().del("auth_user:" + userId);
+    pulse::cache().del("followgraph:" + userId);
+    pulse::cache().del("reel:following:" + userId);
 
     // Best-effort cleanup.
     try {

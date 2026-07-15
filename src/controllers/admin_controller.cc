@@ -46,8 +46,9 @@
 #include <chrono>
 #include <cmath>
 #include <cctype>
-#include <cstdlib>
+#include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <algorithm>
 
@@ -67,7 +68,7 @@ std::string randomHex(int bytes) {
   static const char* kHex = "0123456789abcdef";
   std::vector<unsigned char> buf(static_cast<size_t>(bytes));
   if (RAND_bytes(buf.data(), bytes) != 1) {
-    for (auto& b : buf) b = static_cast<unsigned char>(std::rand() & 0xFF);
+    throw std::runtime_error("Secure random generation failed");
   }
   std::string out;
   out.reserve(static_cast<size_t>(bytes) * 2);
@@ -513,6 +514,11 @@ void AdminController::getUser(const HttpRequestPtr& req,
     // sanitizeForOutput strips passwordHash / loginAttempts / etc. (toJSON parity).
     Json::Value user =
         pulse::models::user::sanitizeForOutput(pulse::bsonjson::toJson(doc->view()));
+    // Admin detail view still shouldn't expose device push tokens, the private
+    // block list, or raw auth identifiers.
+    user.removeMember("fcmTokens");
+    user.removeMember("blockedUsers");
+    user.removeMember("authMethods");
 
     // Recent posts by this author — admin view, so removed posts are included.
     auto posts = pulse::db::collection(pulse::models::post::kCollection);
@@ -831,7 +837,7 @@ void AdminController::getReel(const HttpRequestPtr& req,
     auto ccur = commentsCol.find(make_document(kvp("reel", *oid)), copts);
     for (auto&& c : ccur) {
       Json::Value row = pulse::bsonjson::toJson(c);
-      populateUser(row, "user");
+      populateUser(row, "author");  // ReelComment stores its commenter as `author`.
       comments.append(row);
     }
 
@@ -920,10 +926,42 @@ void AdminController::getDrop(const HttpRequestPtr& req,
     Json::Value drop =
         pulse::models::pulsedrop::sanitizeForOutput(pulse::bsonjson::toJson(doc->view()));
 
-    // participants: [{ user, response, joinedAt }] — populate each user ref.
+    // participants: [{ user, response, joinedAt }] — viral drops can accumulate
+    // thousands of entries, so cap what we return and resolve all user refs with
+    // ONE batched $in lookup instead of a per-participant find_one.
     if (drop.isMember("participants") && drop["participants"].isArray()) {
-      for (Json::Value& p : drop["participants"]) {
-        if (p.isObject()) populateUser(p, "user");
+      Json::Value& parts = drop["participants"];
+      constexpr Json::ArrayIndex kMaxParticipants = 100;
+      if (parts.size() > kMaxParticipants) {
+        Json::Value trimmed(Json::arrayValue);
+        for (Json::ArrayIndex i = 0; i < kMaxParticipants; ++i) trimmed.append(parts[i]);
+        parts = std::move(trimmed);
+      }
+
+      bsoncxx::builder::basic::array oids;
+      for (const Json::Value& p : parts) {
+        if (p.isObject() && p.isMember("user") && p["user"].isString()) {
+          if (auto o = pulse::bsonjson::tryOid(p["user"].asString())) oids.append(*o);
+        }
+      }
+
+      std::unordered_map<std::string, Json::Value> usersById;
+      auto usersCol = pulse::db::collection(pulse::models::user::kCollection);
+      mongocxx::options::find uopts;
+      uopts.projection(make_document(kvp("username", 1), kvp("profile.avatar", 1),
+                                     kvp("avatar", 1)));
+      auto ucur = usersCol.find(
+          make_document(kvp("_id", make_document(kvp("$in", oids.extract())))), uopts);
+      for (auto&& u : ucur) {
+        Json::Value uj = pulse::bsonjson::toJson(u);
+        if (uj.isMember("_id") && uj["_id"].isString()) usersById[uj["_id"].asString()] = uj;
+      }
+
+      for (Json::Value& p : parts) {
+        if (p.isObject() && p.isMember("user") && p["user"].isString()) {
+          auto it = usersById.find(p["user"].asString());
+          if (it != usersById.end()) p["user"] = it->second;
+        }
       }
     }
 

@@ -63,7 +63,8 @@ class UserController : public drogon::HttpController<UserController> {
   // Upload avatar (uploadLimiter + multipart guard/single)
   ADD_METHOD_TO(UserController::uploadAvatar,
                 "/api/v1/users/me/avatar", Post,
-                "pulse::filters::AuthFilter", "pulse::filters::UploadLimiter");
+                "pulse::filters::AuthFilter", "pulse::filters::UploadLimiter",
+                "pulse::filters::UploadGuard");
 
   // Follow / Unfollow
   ADD_METHOD_TO(UserController::toggleFollow,

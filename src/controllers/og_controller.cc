@@ -56,10 +56,58 @@ std::string escapeHtml(const std::string& str) {
       case '<': out += "&lt;"; break;
       case '>': out += "&gt;"; break;
       case '"': out += "&quot;"; break;
+      case '\'': out += "&#39;"; break;
+      case '\r':
+      case '\n':
+      case '\0': break;
       default: out.push_back(c); break;
     }
   }
   return out;
+}
+
+// Encode a value for a JavaScript double-quoted string inside a <script> block.
+// Escaping '<' is essential: otherwise stored text can terminate the script
+// element before JavaScript string parsing takes place.
+std::string escapeJsString(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(value[i]);
+    if (i + 2 < value.size() && c == 0xE2 &&
+        static_cast<unsigned char>(value[i + 1]) == 0x80 &&
+        (static_cast<unsigned char>(value[i + 2]) == 0xA8 ||
+         static_cast<unsigned char>(value[i + 2]) == 0xA9)) {
+      out += static_cast<unsigned char>(value[i + 2]) == 0xA8
+                 ? "\\u2028" : "\\u2029";
+      i += 2;
+      continue;
+    }
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      case '<': out += "\\x3C"; break;
+      case '>': out += "\\x3E"; break;
+      case '&': out += "\\x26"; break;
+      default:
+        if (c >= 0x20 && c != 0x7F) out.push_back(static_cast<char>(c));
+        break;
+    }
+  }
+  return out;
+}
+
+bool safeHttpUrl(const std::string& value) {
+  if (value.size() > 2048 ||
+      (value.rfind("https://", 0) != 0 && value.rfind("http://", 0) != 0)) {
+    return false;
+  }
+  return std::none_of(value.begin(), value.end(), [](unsigned char c) {
+    return c <= 0x20 || c == 0x7F || c == '\\';
+  });
 }
 
 // Parameters for renderOGPage (mirrors the JS destructured object; `type`
@@ -80,9 +128,13 @@ struct OGPageParams {
 std::string renderOGPage(const OGPageParams& p) {
   const std::string safeTitle = escapeHtml(p.title);
   const std::string safeDesc = escapeHtml(p.description);
+  const std::string safeImage = safeHttpUrl(p.image) ? escapeHtml(p.image) : "";
+  const std::string safeUrl = safeHttpUrl(p.url) ? escapeHtml(p.url) : "";
+  const std::string safeType = escapeHtml(p.type);
   // appDeepLink || '#'  and  appDeepLink || ''  (empty deep link is falsy).
-  const std::string hrefDeep = p.appDeepLink.empty() ? std::string("#") : p.appDeepLink;
-  const std::string jsDeep = p.appDeepLink;  // "${appDeepLink || ''}" -> '' when empty
+  const std::string hrefDeep = escapeHtml(
+      p.appDeepLink.empty() ? std::string("#") : p.appDeepLink);
+  const std::string jsDeep = escapeJsString(p.appDeepLink);
 
   std::string html;
   html += "<!DOCTYPE html>\n";
@@ -95,16 +147,16 @@ std::string renderOGPage(const OGPageParams& p) {
   html += "  <!-- Open Graph -->\n";
   html += "  <meta property=\"og:title\"       content=\"" + safeTitle + "\"/>\n";
   html += "  <meta property=\"og:description\" content=\"" + safeDesc + "\"/>\n";
-  html += "  <meta property=\"og:image\"       content=\"" + p.image + "\"/>\n";
-  html += "  <meta property=\"og:url\"         content=\"" + p.url + "\"/>\n";
-  html += "  <meta property=\"og:type\"        content=\"" + p.type + "\"/>\n";
+  html += "  <meta property=\"og:image\"       content=\"" + safeImage + "\"/>\n";
+  html += "  <meta property=\"og:url\"         content=\"" + safeUrl + "\"/>\n";
+  html += "  <meta property=\"og:type\"        content=\"" + safeType + "\"/>\n";
   html += "  <meta property=\"og:site_name\"   content=\"Pulse\"/>\n";
   html += "\n";
   html += "  <!-- Twitter Card -->\n";
   html += "  <meta name=\"twitter:card\"        content=\"summary_large_image\"/>\n";
   html += "  <meta name=\"twitter:title\"       content=\"" + safeTitle + "\"/>\n";
   html += "  <meta name=\"twitter:description\" content=\"" + safeDesc + "\"/>\n";
-  html += "  <meta name=\"twitter:image\"       content=\"" + p.image + "\"/>\n";
+  html += "  <meta name=\"twitter:image\"       content=\"" + safeImage + "\"/>\n";
   html += "\n";
   html += "  <style>\n";
   html += "    body{margin:0;font-family:system-ui,sans-serif;background:#07060B;color:#F0EDF7;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px}\n";
