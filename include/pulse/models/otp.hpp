@@ -38,7 +38,8 @@ void ensureIndexes();
 // --- Defaults / serialization -------------------------------------------------
 
 // Fill in schema defaults + enum-bearing fields on insert (timestamps,
-// userId/verifiedAt nulls, attempts/maxAttempts, verified, userAgent, __v).
+// userId/verifiedAt/deliveredAt nulls, attempts/maxAttempts, verified,
+// superseded, userAgent, and __v).
 // Does NOT supply required fields (identifier, type, purpose, hashedCode,
 // ipAddress, expiresAt) — those must be provided by the caller.
 Json::Value applyDefaults(Json::Value doc);
@@ -51,11 +52,19 @@ Json::Value sanitizeForOutput(Json::Value doc);
 // --- Statics (ported query logic) --------------------------------------------
 
 // otpSchema.statics.findValidOTP(identifier, purpose):
-//   findOne({ identifier, purpose, verified:false, expiresAt:{ $gt: now } })
-//     .sort({ createdAt: -1 })
+//   findOne({ identifier, purpose, verified:false, superseded:{$ne:true},
+//             deliveredAt:{$type:'date'}, expiresAt:{ $gt: now } })
+//     .sort({ deliveredAt: -1, createdAt: -1 })
 // Returns the raw document as Json::Value, or std::nullopt if none.
 std::optional<Json::Value> findValidOTP(const std::string& identifier,
                                         const std::string& purpose);
+
+// Atomically reserves one verification attempt on the newest eligible OTP.
+// The query requires verified:false, expiresAt > now and attempts < maxAttempts,
+// then increments attempts before returning the document. This prevents a burst
+// of concurrent guesses from all passing the attempt-limit check.
+std::optional<Json::Value> reserveVerificationAttempt(
+    const std::string& identifier, const std::string& purpose);
 
 // otpSchema.statics.cleanupExpired():
 //   deleteMany({ expiresAt: { $lt: now } })
@@ -70,8 +79,8 @@ long long cleanupExpired();
 std::optional<int> incrementAttempts(const bsoncxx::oid& id);
 
 // otpSchema.methods.markAsVerified(): verified = true; verifiedAt = now; save().
-// Sets verified:true and verifiedAt:now for the given document. Returns true if
-// a document was modified.
+// Sets verified:true and verifiedAt:now only while the document is still
+// unverified and unexpired. Returns true only for the request that consumed it.
 bool markAsVerified(const bsoncxx::oid& id);
 
 // otpSchema.methods.isExpired(): return this.expiresAt < new Date();

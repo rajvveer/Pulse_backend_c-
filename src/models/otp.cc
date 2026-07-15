@@ -6,6 +6,7 @@
 #include "pulse/logger.hpp"
 
 #include <bsoncxx/builder/basic/document.hpp>
+#include <bsoncxx/builder/basic/array.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/types.hpp>
 #include <mongocxx/options/index.hpp>
@@ -48,7 +49,9 @@ void ensureIndexes() {
     // otpSchema.index({ identifier: 1, purpose: 1, verified: 1 })
     col.create_index(make_document(kvp("identifier", 1),
                                    kvp("purpose", 1),
-                                   kvp("verified", 1)));
+                                   kvp("verified", 1),
+                                   kvp("superseded", 1),
+                                   kvp("deliveredAt", -1)));
 
     // otpSchema.index({ userId: 1 })
     col.create_index(make_document(kvp("userId", 1)));
@@ -95,6 +98,10 @@ Json::Value applyDefaults(Json::Value doc) {
   // verifiedAt: { default: null }
   if (!doc.isMember("verifiedAt")) doc["verifiedAt"] = Json::Value(Json::nullValue);
 
+  // Codes only become eligible after the external provider accepts delivery.
+  if (!doc.isMember("deliveredAt")) doc["deliveredAt"] = Json::Value(Json::nullValue);
+  if (!doc.isMember("superseded")) doc["superseded"] = false;
+
   // userAgent: { default: '' }
   if (!doc.isMember("userAgent")) doc["userAgent"] = "";
 
@@ -130,17 +137,54 @@ std::optional<Json::Value> findValidOTP(const std::string& identifier,
         kvp("identifier", identifier),
         kvp("purpose", purpose),
         kvp("verified", false),
+        kvp("superseded", make_document(kvp("$ne", true))),
+        kvp("deliveredAt", make_document(kvp("$type", "date"))),
         kvp("expiresAt", make_document(kvp("$gt", nowDate()))));
 
-    // .sort({ createdAt: -1 })
+    // The most recently accepted provider delivery is the active code.
     mongocxx::options::find opts{};
-    opts.sort(make_document(kvp("createdAt", -1)));
+    opts.sort(make_document(kvp("deliveredAt", -1), kvp("createdAt", -1)));
 
     auto result = col.find_one(filter.view(), opts);
     if (!result) return std::nullopt;
     return pulse::bsonjson::toJson(result->view());
   } catch (const std::exception& e) {
     pulse::log::error("OTP findValidOTP failed: {}", e.what());
+    throw;
+  }
+}
+
+std::optional<Json::Value> reserveVerificationAttempt(
+    const std::string& identifier, const std::string& purpose) {
+  try {
+    auto col = pulse::db::collection(kCollection);
+
+    // Reserve the attempt in the database before doing the expensive bcrypt
+    // comparison. $expr keeps the max-attempt decision in the same atomic
+    // operation as the increment, so concurrent requests cannot oversubscribe
+    // the configured limit.
+    auto filter = make_document(
+        kvp("identifier", identifier),
+        kvp("purpose", purpose),
+        kvp("verified", false),
+        kvp("superseded", make_document(kvp("$ne", true))),
+        kvp("deliveredAt", make_document(kvp("$type", "date"))),
+        kvp("expiresAt", make_document(kvp("$gt", nowDate()))),
+        kvp("$expr", make_document(kvp(
+            "$lt", bsoncxx::builder::basic::make_array("$attempts", "$maxAttempts")))));
+    auto update = make_document(
+        kvp("$inc", make_document(kvp("attempts", 1))),
+        kvp("$set", make_document(kvp("updatedAt", nowDate()))));
+
+    mongocxx::options::find_one_and_update opts{};
+    opts.sort(make_document(kvp("deliveredAt", -1), kvp("createdAt", -1)));
+    opts.return_document(mongocxx::options::return_document::k_after);
+
+    auto result = col.find_one_and_update(filter.view(), update.view(), opts);
+    if (!result) return std::nullopt;
+    return pulse::bsonjson::toJson(result->view());
+  } catch (const std::exception& e) {
+    pulse::log::error("OTP reserveVerificationAttempt failed: {}", e.what());
     throw;
   }
 }
@@ -170,7 +214,12 @@ std::optional<int> incrementAttempts(const bsoncxx::oid& id) {
     auto col = pulse::db::collection(kCollection);
 
     // this.attempts += 1; this.save();
-    auto filter = make_document(kvp("_id", id));
+    auto filter = make_document(
+        kvp("_id", id),
+        kvp("verified", false),
+        kvp("superseded", make_document(kvp("$ne", true))),
+        kvp("deliveredAt", make_document(kvp("$type", "date"))),
+        kvp("expiresAt", make_document(kvp("$gt", nowDate()))));
     auto update = make_document(kvp("$inc", make_document(kvp("attempts", 1))));
 
     mongocxx::options::find_one_and_update opts{};
@@ -199,7 +248,12 @@ bool markAsVerified(const bsoncxx::oid& id) {
     auto col = pulse::db::collection(kCollection);
 
     // this.verified = true; this.verifiedAt = new Date(); this.save();
-    auto filter = make_document(kvp("_id", id));
+    auto filter = make_document(
+        kvp("_id", id),
+        kvp("verified", false),
+        kvp("superseded", make_document(kvp("$ne", true))),
+        kvp("deliveredAt", make_document(kvp("$type", "date"))),
+        kvp("expiresAt", make_document(kvp("$gt", nowDate()))));
     auto update = make_document(kvp("$set", make_document(
         kvp("verified", true),
         kvp("verifiedAt", nowDate()))));

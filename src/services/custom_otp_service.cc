@@ -3,6 +3,7 @@
 // External HTTP (Brevo email, Twilio SMS) goes through Drogon's HttpClient.
 // OTP codes are bcrypt-hashed (cost 10) and persisted to the "otps" collection.
 #include "pulse/services/custom_otp_service.hpp"
+#include "pulse/services/http_client.hpp"
 
 #include "pulse/cache.hpp"
 #include "pulse/config.hpp"
@@ -15,16 +16,6 @@
 #include <drogon/HttpClient.h>
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
-#include <trantor/net/EventLoopThread.h>
-
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#endif
 
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
@@ -107,13 +98,15 @@ std::string utcDateYmd() {
 // storing real BSON Dates for expiresAt/createdAt/updatedAt.
 //
 // type/purpose/identifier/hashedCode/ipAddress are required; userId optional.
-void createOtpDoc(const std::optional<std::string>& userId,
-                  const std::string& identifier, const std::string& type,
-                  const std::string& purpose, const std::string& hashedCode,
-                  const std::string& ipAddress, long long expiresInMs) {
+bsoncxx::oid createOtpDoc(const std::optional<std::string>& userId,
+                          const std::string& identifier, const std::string& type,
+                          const std::string& purpose, const std::string& hashedCode,
+                          const std::string& ipAddress, long long expiresInMs) {
   auto col = pulse::db::collection(pulse::models::otp::kCollection);
 
   bld::document doc{};
+  const bsoncxx::oid id;
+  doc.append(kvp("_id", id));
   // userId: { default: null } — store an ObjectId when provided, else null.
   if (userId && pulse::bsonjson::isValidOid(*userId)) {
     doc.append(kvp("userId", pulse::bsonjson::oid(*userId)));
@@ -131,6 +124,11 @@ void createOtpDoc(const std::optional<std::string>& userId,
   doc.append(kvp("attempts", 0));
   doc.append(kvp("verified", false));
   doc.append(kvp("verifiedAt", bsoncxx::types::b_null{}));
+  // A code is not eligible for verification until its provider accepted the
+  // message. This lets a failed or concurrent send leave the previous code
+  // usable instead of exposing an undelivered record as the newest OTP.
+  doc.append(kvp("deliveredAt", bsoncxx::types::b_null{}));
+  doc.append(kvp("superseded", false));
   doc.append(kvp("userAgent", ""));
   // timestamps: true
   doc.append(kvp("createdAt", nowDate()));
@@ -138,6 +136,42 @@ void createOtpDoc(const std::optional<std::string>& userId,
   doc.append(kvp("__v", 0));
 
   col.insert_one(doc.view());
+  return id;
+}
+
+void deleteOtpBestEffort(const bsoncxx::oid& id) noexcept {
+  try {
+    pulse::db::collection(pulse::models::otp::kCollection)
+        .delete_one(make_document(kvp("_id", id)));
+  } catch (const std::exception& error) {
+    pulse::log::warn("Failed to roll back undelivered OTP: {}", error.what());
+  }
+}
+
+void activateDeliveredOtp(const std::string& identifier,
+                          const std::string& purpose,
+                          const bsoncxx::oid& id) {
+  auto col = pulse::db::collection(pulse::models::otp::kCollection);
+  const auto deliveredAt = nowDate();
+
+  auto activated = col.update_one(
+      make_document(kvp("_id", id), kvp("verified", false)),
+      make_document(kvp("$set", make_document(
+          kvp("deliveredAt", deliveredAt), kvp("superseded", false),
+          kvp("updatedAt", deliveredAt)))));
+  if (!activated || activated->matched_count() != 1)
+    throw OtpError("Failed to activate delivered OTP");
+
+  // Whichever delivery activation finishes last wins. `$lte` also gives a
+  // deterministic winner when two provider responses land in one millisecond.
+  col.update_many(
+      make_document(
+          kvp("identifier", identifier), kvp("purpose", purpose),
+          kvp("verified", false), kvp("_id", make_document(kvp("$ne", id))),
+          kvp("deliveredAt", make_document(kvp("$type", "date"),
+                                             kvp("$lte", deliveredAt)))),
+      make_document(kvp("$set", make_document(
+          kvp("superseded", true), kvp("updatedAt", deliveredAt)))));
 }
 
 // Standard base64 (for HTTP Basic auth), via OpenSSL so we don't couple to a
@@ -153,26 +187,6 @@ std::string base64Encode(const std::string& in) {
   return out;
 }
 
-// Resolve a hostname to an IPv4 dotted-quad string using the OS resolver
-// (getaddrinfo). We do this ourselves because trantor's async resolver (c-ares)
-// fails to load the Windows system DNS servers when initialized on a short-lived
-// per-call event loop, surfacing as ReqResult::BadServerAddress. getaddrinfo
-// reads the OS config synchronously and reliably. Returns empty on failure.
-std::string resolveHostV4(const std::string& host) {
-  struct addrinfo hints{};
-  hints.ai_family = AF_INET;        // IPv4 (Brevo edge is dual-stack; v4 is fine)
-  hints.ai_socktype = SOCK_STREAM;
-  struct addrinfo* res = nullptr;
-  if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) {
-    return {};
-  }
-  char buf[INET_ADDRSTRLEN] = {0};
-  auto* sin = reinterpret_cast<sockaddr_in*>(res->ai_addr);
-  ::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-  ::freeaddrinfo(res);
-  return std::string(buf);
-}
-
 // One-shot synchronous HTTP call. Returns the response (null on transport
 // failure).
 //
@@ -185,23 +199,10 @@ std::string resolveHostV4(const std::string& host) {
 //
 // Blocking on the future here is safe: this runs on an IO worker thread, while
 // the request is driven by the main loop (a different thread), so there is no
-// self-deadlock. We still pre-resolve via the OS as a fast, clear DNS fail-fast.
+// self-deadlock. DNS resolution remains on Drogon's asynchronous resolver and
+// is covered by the same bounded outbound-request timeout.
 drogon::HttpResponsePtr sendHttpSync(const std::string& baseUrl,
                                      const drogon::HttpRequestPtr& req) {
-  // Parse host out of baseUrl ("https://api.brevo.com") for the fail-fast check.
-  std::string host = baseUrl;
-  auto schemePos = host.find("://");
-  if (schemePos != std::string::npos) host = host.substr(schemePos + 3);
-  auto slash = host.find('/');
-  if (slash != std::string::npos) host = host.substr(0, slash);
-  auto colon = host.find(':');
-  if (colon != std::string::npos) host = host.substr(0, colon);
-
-  if (resolveHostV4(host).empty()) {
-    pulse::log::error("sendHttpSync DNS resolution failed for host {}", host);
-    return nullptr;
-  }
-
   auto* loop = drogon::app().getLoop();  // main loop: clean c-ares resolver
   auto client = drogon::HttpClient::newHttpClient(
       baseUrl, loop, /*useOldTLS=*/false, /*validateCert=*/true);
@@ -211,7 +212,7 @@ drogon::HttpResponsePtr sendHttpSync(const std::string& baseUrl,
   client->sendRequest(
       req, [&prom](drogon::ReqResult r, const drogon::HttpResponsePtr& resp) {
         prom.set_value({r, resp});
-      }, 20.0);
+      }, pulse::services::outboundHttpTimeoutSeconds());
   auto [result, resp] = fut.get();
   if (result != drogon::ReqResult::Ok) {
     const char* reason = "Unknown";
@@ -375,6 +376,7 @@ Json::Value CustomOTPService::sendEmailOTP(const std::string& email,
                                            const std::string& purpose,
                                            const std::optional<std::string>& userId,
                                            const std::string& ipAddress) {
+  std::optional<bsoncxx::oid> storedOtp;
   try {
     if (!emailConfigured_) {
       throw OtpError("Email OTP not configured. Check EMAIL_API_KEY in .env file");
@@ -390,15 +392,16 @@ Json::Value CustomOTPService::sendEmailOTP(const std::string& email,
     const std::string hashedOTP = bcryptHash(otp);
 
     const std::string identifier = toLower(email);
-    createOtpDoc(userId, identifier, "email", purpose, hashedOTP, ipAddress,
-                 10 * 60 * 1000);  // 10 minutes
+    storedOtp = createOtpDoc(userId, identifier, "email", purpose, hashedOTP,
+                             ipAddress, 10 * 60 * 1000);  // 10 minutes
 
     const std::string subject = getEmailSubject(purpose);
     const std::string html = getEmailTemplate(purpose, otp);
 
     sendBrevoEmail(email, subject, html);
+    activateDeliveredOtp(identifier, purpose, *storedOtp);
 
-    pulse::log::info("Email OTP sent to {} for {}", email, purpose);
+    pulse::log::info("Email OTP dispatched for purpose {}", purpose);
 
     Json::Value out(Json::objectValue);
     out["success"]   = true;
@@ -409,6 +412,7 @@ Json::Value CustomOTPService::sendEmailOTP(const std::string& email,
     out["message"]   = "OTP sent to " + email;
     return out;
   } catch (const std::exception& error) {
+    if (storedOtp) deleteOtpBestEffort(*storedOtp);
     pulse::log::error("Email OTP send error: {}", error.what());
     throw OtpError(std::string("Failed to send email OTP: ") + error.what());
   }
@@ -421,6 +425,7 @@ Json::Value CustomOTPService::sendSMSOTP(const std::string& phone,
                                          const std::string& purpose,
                                          const std::optional<std::string>& userId,
                                          const std::string& ipAddress) {
+  std::optional<bsoncxx::oid> storedOtp;
   try {
     if (!twilioConfigured_) {
       throw OtpError("SMS OTP not configured. Please set TWILIO credentials in .env file");
@@ -438,11 +443,12 @@ Json::Value CustomOTPService::sendSMSOTP(const std::string& phone,
     const std::string otp = generateOTP(6);
     const std::string hashedOTP = bcryptHash(otp);
 
-    createOtpDoc(userId, fullPhone, "sms", purpose, hashedOTP, ipAddress,
-                 5 * 60 * 1000);  // 5 minutes
+    storedOtp = createOtpDoc(userId, fullPhone, "sms", purpose, hashedOTP,
+                             ipAddress, 5 * 60 * 1000);  // 5 minutes
 
     const std::string smsBody = getSMSTemplate(purpose, otp);
     sendTwilioSms(fullPhone, smsBody);
+    activateDeliveredOtp(fullPhone, purpose, *storedOtp);
 
     Json::Value out(Json::objectValue);
     out["success"]   = true;
@@ -453,6 +459,7 @@ Json::Value CustomOTPService::sendSMSOTP(const std::string& phone,
     out["message"]   = "OTP sent to " + fullPhone;
     return out;
   } catch (const std::exception& error) {
+    if (storedOtp) deleteOtpBestEffort(*storedOtp);
     pulse::log::error("SMS OTP send error: {}", error.what());
     throw OtpError(std::string("Failed to send SMS OTP: ") + error.what());
   }
@@ -740,10 +747,13 @@ Json::Value CustomOTPService::verifyOTP(const std::string& identifier,
       lookupIdentifier = normalizePhoneToE164(identifier);
     }
 
-    pulse::log::debug("Verifying OTP for original: \"{}\", normalized to: \"{}\"",
-                      identifier, lookupIdentifier);
+    pulse::log::debug("Verifying OTP for purpose {}", purpose);
 
-    auto otpRecord = pulse::models::otp::findValidOTP(lookupIdentifier, purpose);
+    // Atomically consume one attempt before comparing the code. This closes the
+    // read/check/increment race that allowed concurrent guesses to exceed the
+    // per-code attempt limit.
+    auto otpRecord = pulse::models::otp::reserveVerificationAttempt(
+        lookupIdentifier, purpose);
     if (!otpRecord) {
       throw OtpError("Invalid or expired OTP");
     }
@@ -755,12 +765,9 @@ Json::Value CustomOTPService::verifyOTP(const std::string& identifier,
       throw OtpError("OTP has expired");
     }
 
-    // isMaxAttemptsReached(): attempts >= maxAttempts
+    // attempts already includes the reservation made above.
     const int attempts    = rec.get("attempts", 0).asInt();
     const int maxAttempts = rec.get("maxAttempts", 3).asInt();
-    if (pulse::models::otp::isMaxAttemptsReached(attempts, maxAttempts)) {
-      throw OtpError("Maximum verification attempts exceeded");
-    }
 
     const std::string hashedCode = rec.get("hashedCode", "").asString();
     const bool isValid = bcryptCompare(inputOTP, hashedCode);
@@ -769,18 +776,16 @@ Json::Value CustomOTPService::verifyOTP(const std::string& identifier,
     const std::string type     = rec.get("type", "").asString();
 
     if (!isValid) {
-      int newAttempts = attempts;
-      if (auto oid = pulse::bsonjson::tryOid(otpIdHex)) {
-        if (auto inc = pulse::models::otp::incrementAttempts(*oid)) newAttempts = *inc;
-      }
-      int remainingAttempts = std::max(0, maxAttempts - newAttempts);
+      int remainingAttempts = std::max(0, maxAttempts - attempts);
       throw OtpError("Invalid OTP. " + std::to_string(remainingAttempts) +
                      " attempts remaining.");
     }
 
+    bool consumed = false;
     if (auto oid = pulse::bsonjson::tryOid(otpIdHex)) {
-      pulse::models::otp::markAsVerified(*oid);
+      consumed = pulse::models::otp::markAsVerified(*oid);
     }
+    if (!consumed) throw OtpError("Invalid or expired OTP");
 
     // Best-effort: clear the send rate-limit key.
     try {
@@ -789,7 +794,7 @@ Json::Value CustomOTPService::verifyOTP(const std::string& identifier,
       pulse::log::warn("Cache deletion failed on OTP verify: {}", cacheError.what());
     }
 
-    pulse::log::info("OTP verified successfully for {}", lookupIdentifier);
+    pulse::log::info("OTP verified successfully");
 
     Json::Value out(Json::objectValue);
     out["success"]    = true;
@@ -824,15 +829,10 @@ Json::Value CustomOTPService::resendOTP(const std::string& identifier,
       lookupIdentifier = normalizePhoneToE164(identifier);
     }
 
-    // OTP.deleteMany({ identifier: lookupIdentifier, purpose, verified: false })
-    {
-      auto col = pulse::db::collection(pulse::models::otp::kCollection);
-      col.delete_many(make_document(kvp("identifier", lookupIdentifier),
-                                    kvp("purpose", purpose),
-                                    kvp("verified", false)));
-    }
-
-    // NOTE: deliberately NOT clearing the rate-limit key here.
+    // Keep the currently valid code until the replacement has actually been
+    // delivered. The send path atomically identifies its new record and only
+    // then removes older unverified records.
+    (void)lookupIdentifier;
 
     if (type == "email") {
       return sendEmailOTP(identifier, purpose, userId, ipAddress);
@@ -900,8 +900,10 @@ void CustomOTPService::sendBrevoEmail(const std::string& toEmail,
   }
   int status = static_cast<int>(resp->getStatusCode());
   if (status < 200 || status >= 300) {
-    throw OtpError("Brevo email send failed with status " + std::to_string(status) +
-                   ": " + std::string(resp->getBody()));
+    // Provider bodies can echo recipient details; keep them out of exceptions
+    // because callers log those exceptions.
+    throw OtpError("Brevo email send failed with status " +
+                   std::to_string(status));
   }
 }
 
@@ -927,15 +929,11 @@ void CustomOTPService::sendTwilioSms(const std::string& toE164,
   }
   int status = static_cast<int>(resp->getStatusCode());
   if (status < 200 || status >= 300) {
-    throw OtpError("Twilio SMS send failed with status " + std::to_string(status) +
-                   ": " + std::string(resp->getBody()));
+    throw OtpError("Twilio SMS send failed with status " +
+                   std::to_string(status));
   }
 
-  // Log the returned message SID for parity with the JS service.
-  auto json = resp->getJsonObject();
-  if (json && json->isMember("sid")) {
-    pulse::log::info("Twilio message SID: {}", (*json)["sid"].asString());
-  }
+  pulse::log::info("Twilio SMS dispatched");
 }
 
 } // namespace pulse
