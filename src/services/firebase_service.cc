@@ -4,6 +4,7 @@
 // (RS256) and Drogon's HttpClient (Google REST endpoints). Behavior, field names,
 // and error messages mirror the JS source exactly.
 #include "pulse/services/firebase_service.hpp"
+#include "pulse/services/http_client.hpp"
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
 
@@ -13,7 +14,10 @@
 #include <jwt-cpp/traits/open-source-parsers-jsoncpp/defaults.h>
 
 #include <chrono>
+#include <fstream>
+#include <memory>
 #include <mutex>
+#include <sstream>
 
 namespace pulse {
 
@@ -39,6 +43,22 @@ long long nowEpochSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(
              std::chrono::system_clock::now().time_since_epoch())
       .count();
+}
+
+bool loadServiceAccountFile(const std::string& path, Json::Value& out) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+  std::ostringstream buffer;
+  buffer << file.rdbuf();
+  const std::string content = buffer.str();
+  if (content.empty() || content.size() > 1024 * 1024) return false;
+
+  Json::CharReaderBuilder builder;
+  builder["collectComments"] = false;
+  std::string errors;
+  std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+  return reader->parse(content.data(), content.data() + content.size(), &out,
+                       &errors) && out.isObject();
 }
 
 // Synchronous HTTP GET/POST against an absolute https URL via Drogon's
@@ -70,7 +90,8 @@ drogon::HttpResponsePtr httpSend(const std::string& url,
     req->setBody(body);
     if (!contentType.empty()) req->setContentTypeString(contentType);
   }
-  auto [result, resp] = client->sendRequest(req);
+  auto [result, resp] = client->sendRequest(
+      req, pulse::services::outboundHttpTimeoutSeconds());
   if (result != drogon::ReqResult::Ok) return nullptr;
   return resp;
 }
@@ -93,13 +114,30 @@ bool FirebaseService::initialize() {
 
   // 2. Read Firebase config from env — the SAME keys config/index.js mapped
   //    under config.get('firebase').
-  projectId_    = cfg.env("FIREBASE_PROJECT_ID");
-  privateKeyId_ = cfg.env("FIREBASE_PRIVATE_KEY_ID");
-  privateKey_   = unescapeNewlines(cfg.env("FIREBASE_PRIVATE_KEY"));
-  clientEmail_  = cfg.env("FIREBASE_CLIENT_EMAIL");
-  clientId_     = cfg.env("FIREBASE_CLIENT_ID");
-  authUri_      = cfg.env("FIREBASE_AUTH_URI");
-  tokenUri_     = cfg.env("FIREBASE_TOKEN_URI");
+  const std::string serviceAccountPath =
+      cfg.env("FIREBASE_SERVICE_ACCOUNT_PATH");
+  if (!serviceAccountPath.empty()) {
+    Json::Value serviceAccount;
+    if (!loadServiceAccountFile(serviceAccountPath, serviceAccount)) {
+      pulse::log::error("Unable to read Firebase service-account file");
+      return false;
+    }
+    projectId_    = serviceAccount.get("project_id", "").asString();
+    privateKeyId_ = serviceAccount.get("private_key_id", "").asString();
+    privateKey_   = serviceAccount.get("private_key", "").asString();
+    clientEmail_  = serviceAccount.get("client_email", "").asString();
+    clientId_     = serviceAccount.get("client_id", "").asString();
+    authUri_      = serviceAccount.get("auth_uri", "").asString();
+    tokenUri_     = serviceAccount.get("token_uri", "").asString();
+  } else {
+    projectId_    = cfg.env("FIREBASE_PROJECT_ID");
+    privateKeyId_ = cfg.env("FIREBASE_PRIVATE_KEY_ID");
+    privateKey_   = unescapeNewlines(cfg.env("FIREBASE_PRIVATE_KEY"));
+    clientEmail_  = cfg.env("FIREBASE_CLIENT_EMAIL");
+    clientId_     = cfg.env("FIREBASE_CLIENT_ID");
+    authUri_      = cfg.env("FIREBASE_AUTH_URI");
+    tokenUri_     = cfg.env("FIREBASE_TOKEN_URI");
+  }
 
   // 3. Incomplete config: warn, disable Firebase features, return null/false.
   if (projectId_.empty() || privateKey_.empty() || clientEmail_.empty()) {
@@ -243,6 +281,7 @@ std::string FirebaseService::createCustomToken(const std::string& userId,
 }
 
 std::string FirebaseService::getAccessToken(const std::string& scope) {
+  std::lock_guard<std::mutex> tokenLock(tokenMutex_);
   long long now = nowEpochSeconds();
   // Reuse a cached token while it has > 60s of life left.
   if (!cachedToken_.empty() && cachedTokenExpiry_ - 60 > now) {

@@ -14,6 +14,8 @@
 #include "pulse/bson_json.hpp"
 #include "pulse/http_response.hpp"
 #include "pulse/logger.hpp"
+#include "pulse/filters/rate_limit_filters.hpp"
+#include "pulse/models/session.hpp"
 #include "pulse/services/auth_service.hpp"
 
 using namespace pulse::controllers;
@@ -56,6 +58,9 @@ std::string validatePhoneNumber(const std::string& phone) {
 
 // validateEmail(email): /^[^\s@]+@[^\s@]+\.[^\s@]+$/, then lowercase + trim.
 std::string validateEmail(const std::string& email) {
+  if (email.empty() || email.size() > 254) {
+    throw std::runtime_error("Please enter a valid email address");
+  }
   // Manual check mirroring the regex: non-empty local part (no space/@),
   // single '@', domain with a '.' and non-space/@ segments around it.
   auto isBad = [](char c) { return c == ' ' || c == '\t' || c == '\n' ||
@@ -68,7 +73,8 @@ std::string validateEmail(const std::string& email) {
     }
   }
   bool valid = false;
-  if (at != std::string::npos && at > 0 && at + 1 < email.size()) {
+  if (at != std::string::npos && at > 0 && at <= 64 &&
+      at + 1 < email.size() && email.size() - at - 1 <= 253) {
     // local part: [^\s@]+
     bool localOk = true;
     for (size_t i = 0; i < at; ++i) if (isBad(email[i])) { localOk = false; break; }
@@ -102,7 +108,7 @@ std::string buildE164Phone(const std::string& identifier) {
 
 // req.ip || '127.0.0.1'
 std::string clientIp(const drogon::HttpRequestPtr& req) {
-  std::string ip = req->getPeerAddr().toIp();
+  std::string ip = pulse::filters::clientIp(req);
   if (ip.empty()) return "127.0.0.1";
   return ip;
 }
@@ -123,6 +129,18 @@ bool jhas(const Json::Value& body, const char* key) {
   if (v.isString()) return !v.asString().empty();
   if (v.isBool()) return v.asBool();
   return true;
+}
+
+bool validDeviceInfo(const DeviceInfo& info) {
+  const auto optionalWithin = [](const std::optional<std::string>& value,
+                                 std::size_t max) {
+    return !value || value->size() <= max;
+  };
+  return !info.deviceId.empty() && info.deviceId.size() <= 200 &&
+         pulse::models::session::isValidPlatform(info.platform) &&
+         optionalWithin(info.deviceName, 200) &&
+         optionalWithin(info.appVersion, 64) &&
+         optionalWithin(info.osVersion, 128);
 }
 
 // std::string::contains substitute (pre-C++23).
@@ -185,6 +203,12 @@ void AuthController::initiateAuth(const HttpRequestPtr& req,
                            "MISSING_DEVICE_ID"));
       return;
     }
+    if (!validDeviceInfo(deviceInfo)) {
+      callback(http::error(drogon::k400BadRequest,
+                           "Invalid device information",
+                           "INVALID_DEVICE_INFO"));
+      return;
+    }
 
     Json::Value result = authService().initiateAuth(
         processedIdentifier, method, deviceInfo, clientIp(req));
@@ -195,7 +219,9 @@ void AuthController::initiateAuth(const HttpRequestPtr& req,
 
   } catch (const std::exception& error) {
     pulse::log::error("Auth initiation error: {}", error.what());
-    callback(http::error(drogon::k400BadRequest, error.what(), "AUTH_INITIATION_FAILED"));
+    callback(http::error(drogon::k400BadRequest,
+                         "Unable to start authentication",
+                         "AUTH_INITIATION_FAILED"));
   }
 }
 
@@ -238,6 +264,12 @@ void AuthController::verifyOTP(const HttpRequestPtr& req,
     DeviceInfo deviceInfo;
     deviceInfo.deviceId = deviceId;
     deviceInfo.platform = jhas(body, "platform") ? jstr(body, "platform") : "web";
+    if (!validDeviceInfo(deviceInfo)) {
+      callback(http::error(drogon::k400BadRequest,
+                           "Invalid device information",
+                           "INVALID_DEVICE_INFO"));
+      return;
+    }
 
     Json::Value result = authService().verifyOTPAndAuth(
         lookupIdentifier, otp, method, deviceInfo, clientIp(req));
@@ -253,7 +285,9 @@ void AuthController::verifyOTP(const HttpRequestPtr& req,
       return;
     }
 
-    callback(http::error(drogon::k400BadRequest, msg, "OTP_VERIFICATION_FAILED"));
+    callback(http::error(drogon::k400BadRequest,
+                         "OTP verification failed",
+                         "OTP_VERIFICATION_FAILED"));
   }
 }
 
@@ -282,6 +316,12 @@ void AuthController::createUsername(const HttpRequestPtr& req,
     DeviceInfo deviceInfo;
     deviceInfo.deviceId = deviceId;
     deviceInfo.platform = jhas(body, "platform") ? jstr(body, "platform") : "web";
+    if (!validDeviceInfo(deviceInfo)) {
+      callback(http::error(drogon::k400BadRequest,
+                           "Invalid device information",
+                           "INVALID_DEVICE_INFO"));
+      return;
+    }
 
     Json::Value result = authService().createUsernameAndPassword(
         tempToken, username, password, deviceInfo, clientIp(req));
@@ -294,6 +334,11 @@ void AuthController::createUsername(const HttpRequestPtr& req,
 
     if (!msg.empty() && contains(msg, "Username must be")) {
       callback(http::error(drogon::k400BadRequest, msg, "INVALID_USERNAME"));
+      return;
+    }
+
+    if (!msg.empty() && contains(msg, "Password must be")) {
+      callback(http::error(drogon::k400BadRequest, msg, "INVALID_PASSWORD"));
       return;
     }
 
@@ -386,7 +431,9 @@ void AuthController::resendOTP(const HttpRequestPtr& req,
 
   } catch (const std::exception& error) {
     pulse::log::error("Resend OTP error: {}", error.what());
-    callback(http::error(drogon::k400BadRequest, error.what(), "RESEND_OTP_FAILED"));
+    callback(http::error(drogon::k400BadRequest,
+                         "Unable to resend OTP",
+                         "RESEND_OTP_FAILED"));
   }
 }
 
@@ -494,8 +541,14 @@ void AuthController::firebaseLogin(const HttpRequestPtr& req,
 
     DeviceInfo deviceInfo;
     deviceInfo.deviceId = deviceId;
-    deviceInfo.platform = jhas(body, "platform") ? jstr(body, "platform") : "mobile";
+    deviceInfo.platform = jhas(body, "platform") ? jstr(body, "platform") : "web";
     deviceInfo.deviceName = jhas(body, "deviceName") ? jstr(body, "deviceName") : "Unknown";
+    if (!validDeviceInfo(deviceInfo)) {
+      callback(http::error(drogon::k400BadRequest,
+                           "Invalid device information",
+                           "INVALID_DEVICE_INFO"));
+      return;
+    }
 
     // Pass extra info from frontend as fallback for token verification.
     Json::Value extraInfo(Json::objectValue);
@@ -521,8 +574,7 @@ void AuthController::firebaseLogin(const HttpRequestPtr& req,
     }
 
     callback(http::error(drogon::k401Unauthorized,
-                         msg.empty() ? "Authentication failed" : msg,
-                         "AUTH_FAILED"));
+                         "Authentication failed", "AUTH_FAILED"));
   }
 }
 

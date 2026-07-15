@@ -22,6 +22,7 @@
 #pragma once
 #include <string>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <json/json.h>
 
@@ -98,6 +99,7 @@ private:
   // Cached service-account access token (value + unix-epoch expiry seconds).
   std::string cachedToken_;
   long long   cachedTokenExpiry_ = 0;
+  std::mutex  tokenMutex_;
 };
 
 // Convenience free function matching the JS `firebaseConfig` singleton usage.

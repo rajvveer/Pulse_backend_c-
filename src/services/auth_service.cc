@@ -16,10 +16,12 @@
 #include "pulse/db.hpp"
 #include "pulse/cache.hpp"
 #include "pulse/jwt_service.hpp"
+#include "pulse/config.hpp"
 #include "pulse/bson_json.hpp"
 #include "pulse/logger.hpp"
 #include "pulse/models/user.hpp"
 #include "pulse/models/session.hpp"
+#include "pulse/services/http_client.hpp"
 
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/array.hpp>
@@ -28,6 +30,8 @@
 #include <bsoncxx/oid.hpp>
 #include <mongocxx/collection.hpp>
 #include <mongocxx/options/find.hpp>
+#include <mongocxx/options/find_one_and_update.hpp>
+#include <mongocxx/exception/operation_exception.hpp>
 
 #include <drogon/HttpClient.h>
 #include <drogon/HttpRequest.h>
@@ -80,8 +84,7 @@ std::string hashToken(const std::string& token) {
 std::string randomHex(size_t bytes) {
   std::vector<unsigned char> buf(bytes);
   if (RAND_bytes(buf.data(), static_cast<int>(bytes)) != 1) {
-    // Extremely unlikely; fall back so we never emit an empty tokenId.
-    for (auto& b : buf) b = static_cast<unsigned char>(std::rand() & 0xFF);
+    throw std::runtime_error("Secure random generation failed");
   }
   std::ostringstream os;
   for (unsigned char c : buf)
@@ -130,6 +133,48 @@ pulse::AccessClaims accessClaimsFor(const Json::Value& user) {
   return c;
 }
 
+std::vector<std::string> splitCsv(const std::string& input) {
+  std::vector<std::string> out;
+  std::stringstream ss(input);
+  std::string value;
+  while (std::getline(ss, value, ',')) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    const auto last = value.find_last_not_of(" \t\r\n");
+    if (first != std::string::npos) out.push_back(value.substr(first, last - first + 1));
+  }
+  return out;
+}
+
+bool jsonBool(const Json::Value& value) {
+  if (value.isBool()) return value.asBool();
+  if (value.isString()) {
+    std::string s = value.asString();
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s == "true" || s == "1";
+  }
+  return value.isNumeric() && value.asInt64() != 0;
+}
+
+std::string googleTokenAudience(const Json::Value& tokenInfo) {
+  for (const char* key : {"aud", "audience", "issued_to", "azp"}) {
+    const std::string value = str(tokenInfo, key);
+    if (!value.empty()) return value;
+  }
+  return "";
+}
+
+bool isAllowedGoogleAudience(const std::string& audience) {
+  if (audience.empty()) return false;
+  auto& cfg = pulse::config();
+  std::string configured = cfg.env("GOOGLE_OAUTH_CLIENT_IDS");
+  if (configured.empty()) configured = cfg.env("GOOGLE_CLIENT_ID");
+  for (const auto& allowed : splitCsv(configured)) {
+    if (allowed == audience) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 AuthService& AuthService::instance() {
@@ -145,7 +190,7 @@ Json::Value AuthService::initiateAuth(const std::string& identifier,
                                       const DeviceInfo& deviceInfo,
                                       const std::string& ipAddress) {
   try {
-    pulse::log::info("Initiating {} auth for: {}", method, identifier);
+    pulse::log::info("Initiating {} authentication", method);
 
     // Validate method
     if (method != "email" && method != "phone") {
@@ -177,8 +222,6 @@ Json::Value AuthService::initiateAuth(const std::string& identifier,
     const bool userExists = existingUser.has_value();
     const std::string purpose = userExists ? "login" : "signup";
 
-    pulse::log::info("User exists: {}, Purpose: {}", userExists, purpose);
-
     // Send OTP based on method.
     const std::string existingUserId = userExists ? docId(*existingUser) : "";
     if (method == "email") {
@@ -196,9 +239,9 @@ Json::Value AuthService::initiateAuth(const std::string& identifier,
     out["method"]     = method;
     out["identifier"] = normalizedIdentifier;
     out["nextStep"]   = "verify_otp";
-    out["purpose"]    = purpose;
-    out["userExists"] = userExists;
-    out["message"]    = "OTP sent to " + normalizedIdentifier;
+    // Do not expose whether the identifier is already registered. Verification
+    // recomputes the purpose server-side, so clients do not need this metadata.
+    out["message"]    = "If the identifier is valid, an OTP has been sent";
     return out;
   } catch (const std::exception& e) {
     pulse::log::error("{} auth initiation error: {}", method, e.what());
@@ -244,7 +287,7 @@ HttpResult httpGetJson(const std::string& url,
         req,
         [&prom](drogon::ReqResult rr, const drogon::HttpResponsePtr& resp) {
           prom.set_value({rr, resp});
-        });
+        }, pulse::services::outboundHttpTimeoutSeconds());
     auto [rr, resp] = fut.get();
 
     if (rr != drogon::ReqResult::Ok || !resp) return result;
@@ -267,59 +310,96 @@ Json::Value AuthService::loginWithFirebase(const std::string& idToken,
                                            const std::string& ipAddress,
                                            const Json::Value& extraInfo) {
   try {
+    (void)extraInfo;  // profile metadata is accepted only from verified providers
     std::string email, name, picture, googleId;
 
-    // Strategy 1: Firebase Admin SDK verification (Firebase ID tokens).
-    bool firebaseVerified = false;
-    if (!idToken.empty() && firebase::isAvailable()) {
+    bool providerVerified = false;
+
+    // Firebase ID tokens are accepted only through Firebase verification. An ID
+    // token must never fall through and be reinterpreted as an OAuth access
+    // token, because those token types have different audience semantics.
+    if (!idToken.empty() && pulse::config().getBool("features.enableFirebaseAuth")) {
+      if (!firebase::isAvailable()) {
+        throw std::runtime_error("Firebase authentication is unavailable");
+      }
+      Json::Value decoded = firebase::verifyIdToken(idToken);
+      email    = str(decoded, "email");
+      name     = str(decoded, "name");
+      picture  = str(decoded, "picture");
+      googleId = str(decoded, "uid");
+      if (googleId.empty())
+        throw std::runtime_error("Firebase token has no subject");
+      if (!decoded.get("emailVerified", false).asBool())
+        throw std::runtime_error("Firebase email is not verified");
+      providerVerified = true;
+      pulse::log::info("Firebase identity token verified");
+    }
+
+    // Google access tokens are accepted only when the feature is explicitly
+    // enabled and tokeninfo confirms that the token was issued to one of this
+    // deployment's OAuth client IDs. userinfo alone proves a Google identity,
+    // but not that the token was minted for Pulse.
+    if (!providerVerified && !accessToken.empty()) {
+      if (!pulse::config().getBool("features.enableGoogleLogin")) {
+        throw std::runtime_error("Google authentication is disabled");
+      }
+      const std::string configuredClients =
+          pulse::config().env("GOOGLE_OAUTH_CLIENT_IDS",
+                              pulse::config().env("GOOGLE_CLIENT_ID"));
+      if (configuredClients.empty()) {
+        throw std::runtime_error("Google OAuth client ID is not configured");
+      }
+
       try {
-        Json::Value decoded = firebase::verifyIdToken(idToken);
-        email   = str(decoded, "email");
-        name    = str(decoded, "name");
-        picture = str(decoded, "picture");
-        googleId = str(decoded, "uid");
-        firebaseVerified = true;
-        pulse::log::info("Firebase token verified for: {}", email);
-      } catch (const std::exception& fbErr) {
-        pulse::log::info(
-            "Firebase verification failed (expected for Google OAuth tokens): {}",
-            fbErr.what());
+        auto tokenInfo = httpGetJson(
+            "https://oauth2.googleapis.com/tokeninfo?access_token=" + accessToken);
+        if (!tokenInfo.ok ||
+            !isAllowedGoogleAudience(googleTokenAudience(tokenInfo.body))) {
+          throw std::runtime_error("Google token audience mismatch");
+        }
+
+        auto googleResponse = httpGetJson(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            {{"Authorization", "Bearer " + accessToken}});
+        if (!googleResponse.ok) {
+          throw std::runtime_error("Google userinfo request failed");
+        }
+
+        const std::string tokenEmail = str(tokenInfo.body, "email");
+        const std::string userInfoEmail = str(googleResponse.body, "email");
+        if (!tokenEmail.empty() && !userInfoEmail.empty() &&
+            tokenEmail != userInfoEmail) {
+          throw std::runtime_error("Google token identity mismatch");
+        }
+
+        bool emailVerified = false;
+        for (const char* key : {"email_verified", "verified_email"}) {
+          if (tokenInfo.body.isMember(key))
+            emailVerified = emailVerified || jsonBool(tokenInfo.body[key]);
+          if (googleResponse.body.isMember(key))
+            emailVerified = emailVerified || jsonBool(googleResponse.body[key]);
+        }
+        if (!emailVerified) {
+          throw std::runtime_error("Google email is not verified");
+        }
+
+        email    = !userInfoEmail.empty() ? userInfoEmail : tokenEmail;
+        name     = str(googleResponse.body, "name");
+        picture  = str(googleResponse.body, "picture");
+        googleId = str(googleResponse.body, "sub");
+        if (googleId.empty()) googleId = str(tokenInfo.body, "user_id");
+        providerVerified = true;
+        pulse::log::info("Google OAuth access token verified");
+      } catch (const std::exception& googleErr) {
+        pulse::log::warn("Google token verification rejected: {}", googleErr.what());
+        throw std::runtime_error("Invalid authentication token");
       }
     }
 
-    // Strategy 2: Verify the Google access token directly via Google's API.
-    const std::string googleToken = !accessToken.empty() ? accessToken : idToken;
-    if (!firebaseVerified && !googleToken.empty()) {
-      try {
-        auto googleResponse = httpGetJson(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
-            {{"Authorization", "Bearer " + googleToken}});
-
-        if (googleResponse.ok) {
-          email   = str(googleResponse.body, "email");
-          name    = str(googleResponse.body, "name");
-          picture = str(googleResponse.body, "picture");
-          googleId = str(googleResponse.body, "sub");
-          pulse::log::info("Google token verified via userinfo API for: {}", email);
-        } else {
-          // Fallback: tokeninfo endpoint.
-          auto tokenInfoResponse = httpGetJson(
-              "https://oauth2.googleapis.com/tokeninfo?access_token=" + googleToken);
-          if (tokenInfoResponse.ok) {
-            email    = str(tokenInfoResponse.body, "email");
-            googleId = str(tokenInfoResponse.body, "sub");
-            // tokeninfo returns no name/picture; use extraInfo from the frontend.
-            name    = str(extraInfo, "name");
-            picture = str(extraInfo, "picture");
-            pulse::log::info("Google token verified via tokeninfo API for: {}", email);
-          } else {
-            throw std::runtime_error("Google token verification failed");
-          }
-        }
-      } catch (const std::exception& googleErr) {
-        pulse::log::error("Google token verification failed: {}", googleErr.what());
-        throw std::runtime_error("Invalid authentication token");
-      }
+    if (!providerVerified) {
+      if (!idToken.empty())
+        throw std::runtime_error("Firebase authentication is disabled");
+      throw std::runtime_error("Invalid authentication token");
     }
 
     if (email.empty()) {
@@ -328,7 +408,7 @@ Json::Value AuthService::loginWithFirebase(const std::string& idToken,
 
     const std::string identifier = email;
     const std::string method = "email";
-    pulse::log::info("Google Login: {} - {}", method, identifier);
+    pulse::log::info("Federated login identity verified");
 
     auto col = pulse::db::collection(pulse::models::user::kCollection);
 
@@ -337,7 +417,7 @@ Json::Value AuthService::loginWithFirebase(const std::string& idToken,
     Json::Value user;
 
     if (!userOpt) {
-      pulse::log::info("Creating new user from Google: {}", identifier);
+      pulse::log::info("Creating user from verified federated identity");
 
       Json::Value via(Json::objectValue);
       via["verified"] = true;
@@ -501,7 +581,7 @@ Json::Value AuthService::createNewUser(const std::string& method,
                                        const std::string& identifier,
                                        const Json::Value& /*otpResult*/) {
   try {
-    pulse::log::info("Creating new user for {}: {}", method, identifier);
+    pulse::log::info("Creating new user for {} authentication", method);
 
     auto col = pulse::db::collection(pulse::models::user::kCollection);
 
@@ -607,7 +687,7 @@ Json::Value AuthService::createNewUser(const std::string& method,
     if (!created) throw std::runtime_error("Failed to load created user");
 
     Json::Value newUser = pulse::bsonjson::toJson(created->view());
-    pulse::log::info("New user created: {}", docId(newUser));
+    pulse::log::info("New user created");
     return newUser;
   } catch (const std::exception& e) {
     pulse::log::error("New user creation error: {}", e.what());
@@ -624,80 +704,74 @@ Json::Value AuthService::updateUserAuthMethod(Json::Value user,
   try {
     auto col = pulse::db::collection(pulse::models::user::kCollection);
     auto oid = pulse::bsonjson::oid(docId(user));
-
     const auto now = nowDate();
 
-    // Locate an existing authMethods entry with the same type + identifier.
-    Json::Value& authMethods = user["authMethods"];
-    if (!authMethods.isArray()) authMethods = Json::Value(Json::arrayValue);
+      // Mutate only the matching array element. Replacing authMethods from a
+      // stale user snapshot could discard a concurrent login method and also
+      // rewrote unrelated verifiedAt timestamps.
+      auto match = make_document(kvp("type", method),
+                                 kvp("identifier", identifier));
+      auto existing = col.update_one(
+          make_document(kvp("_id", oid),
+                        kvp("authMethods", make_document(
+                            kvp("$elemMatch", match.view())))),
+          make_document(kvp("$set", make_document(
+              kvp("authMethods.$.verified", true),
+              kvp("authMethods.$.verifiedAt", now),
+              kvp("isVerified", true), kvp("lastLoginAt", now),
+              kvp("updatedAt", now)))));
 
-    int matchIdx = -1;
-    for (int i = 0; i < static_cast<int>(authMethods.size()); ++i) {
-      const auto& am = authMethods[i];
-      if (str(am, "type") == method && str(am, "identifier") == identifier) {
-        matchIdx = i;
-        break;
+      if (!existing || existing->matched_count() == 0) {
+        // Concurrent additions of different methods compose via $push; the
+        // absence predicate prevents duplicate copies of the same pair.
+        auto absent = make_document(kvp(
+            "$not", make_document(kvp("$elemMatch", match.view()))));
+        auto added = col.update_one(
+            make_document(kvp("_id", oid), kvp("authMethods", absent.view())),
+            make_document(
+                kvp("$push", make_document(kvp("authMethods", make_document(
+                    kvp("type", method), kvp("identifier", identifier),
+                    kvp("verified", true), kvp("verifiedAt", now))))),
+                kvp("$set", make_document(
+                    kvp("isVerified", true), kvp("lastLoginAt", now),
+                    kvp("updatedAt", now)))));
+        if (!added || added->matched_count() == 0) {
+          // Another request inserted this pair between the two operations.
+          col.update_one(
+              make_document(kvp("_id", oid),
+                            kvp("authMethods", make_document(
+                                kvp("$elemMatch", match.view())))),
+              make_document(kvp("$set", make_document(
+                  kvp("authMethods.$.verified", true),
+                  kvp("authMethods.$.verifiedAt", now),
+                  kvp("isVerified", true), kvp("lastLoginAt", now),
+                  kvp("updatedAt", now)))));
+        }
       }
-    }
 
-    // Rebuild the full authMethods array (with the add/update applied) so we can
-    // persist it via $set, preserving the existing entries' fields verbatim.
-    bld::array newAuthMethods;
-    auto appendEntry = [&](const Json::Value& am, bool forceVerified) {
-      bld::document e;
-      // Preserve all existing scalar fields, overriding verified/verifiedAt when
-      // this is the matched entry.
-      for (const auto& key : am.getMemberNames()) {
-        if (key == "verified" || key == "verifiedAt") continue;
-        const Json::Value& v = am[key];
-        if (v.isString())      e.append(kvp(key, v.asString()));
-        else if (v.isBool())   e.append(kvp(key, v.asBool()));
-        else if (v.isIntegral()) e.append(kvp(key, static_cast<int64_t>(v.asInt64())));
-        else if (v.isDouble()) e.append(kvp(key, v.asDouble()));
+      // Fill the canonical shortcut only while it is truly unset; never
+      // overwrite a value established by another authentication request.
+      const std::string shortcut = method == "email" ? "email" :
+                                   method == "phone" ? "phone" : "";
+      if (!shortcut.empty()) {
+        bld::array unsetValues;
+        unsetValues.append(make_document(
+            kvp(shortcut, make_document(kvp("$exists", false)))));
+        unsetValues.append(
+            make_document(kvp(shortcut, bsoncxx::types::b_null{})));
+        unsetValues.append(make_document(kvp(shortcut, "")));
+        col.update_one(
+            make_document(kvp("_id", oid),
+                          kvp("$or", unsetValues.extract())),
+            make_document(
+                kvp("$set", make_document(kvp(shortcut, identifier)))));
       }
-      e.append(kvp("verified", forceVerified ? true : am.get("verified", false).asBool()));
-      if (forceVerified) {
-        e.append(kvp("verifiedAt", now));
-      } else if (am.isMember("verifiedAt") && am["verifiedAt"].isString()) {
-        // keep original (rare path — non-matched entries pass through untouched)
-        e.append(kvp("verifiedAt", am["verifiedAt"].asString()));
-      }
-      newAuthMethods.append(e.extract());
-    };
 
-    for (int i = 0; i < static_cast<int>(authMethods.size()); ++i) {
-      appendEntry(authMethods[i], i == matchIdx);
-    }
-    if (matchIdx < 0) {
-      // Push a brand-new method entry.
-      newAuthMethods.append(make_document(
-          kvp("type", method),
-          kvp("identifier", identifier),
-          kvp("verified", true),
-          kvp("verifiedAt", now)));
-    }
+      pulse::log::info("Updated user authentication method");
+      auto refreshed = col.find_one(make_document(kvp("_id", oid)));
+      if (refreshed) return pulse::bsonjson::toJson(refreshed->view());
+      return user;
 
-    // $set updates: authMethods, isVerified, lastLoginAt, + email/phone if unset.
-    bld::document setDoc;
-    setDoc.append(kvp("authMethods", newAuthMethods.extract()));
-    if (method == "email" && str(user, "email").empty()) {
-      setDoc.append(kvp("email", identifier));
-    } else if (method == "phone" && str(user, "phone").empty()) {
-      setDoc.append(kvp("phone", identifier));
-    }
-    setDoc.append(kvp("isVerified", true));
-    setDoc.append(kvp("lastLoginAt", now));
-    setDoc.append(kvp("updatedAt", now));
-
-    col.update_one(make_document(kvp("_id", oid)).view(),
-                   make_document(kvp("$set", setDoc.extract())).view());
-
-    pulse::log::info("Updated auth method for user: {}", docId(user));
-
-    // Return the freshly-saved document (callers read username/email/etc.).
-    auto refreshed = col.find_one(make_document(kvp("_id", oid)).view());
-    if (refreshed) return pulse::bsonjson::toJson(refreshed->view());
-    return user;
   } catch (const std::exception& e) {
     pulse::log::error("Update user auth method error: {}", e.what());
     throw;
@@ -747,26 +821,43 @@ Json::Value AuthService::createUsernameAndPassword(const std::string& tempToken,
           "Username must be 3-20 characters, alphanumeric and underscores only");
     }
 
-    // Validate password: length >= 8.
-    if (password.size() < 8) {
-      throw std::runtime_error("Password must be at least 8 characters long");
+    // bcrypt only considers the first 72 bytes; rejecting longer values avoids
+    // accepting distinct-looking passwords that verify as the same secret.
+    if (password.size() < 8 || password.size() > 72) {
+      throw std::runtime_error("Password must be between 8 and 72 bytes long");
     }
-
-    pulse::log::info("Username created for user: {}", decoded.userId);
 
     // Hash password (bcrypt cost 12) and set username.
     const std::string passwordHash = bcryptHash(password);
     const auto now = nowDate();
 
     auto setDoc = make_document(
-        kvp("username", username),
+        kvp("username", lowered),
+        kvp("profile.displayName", lowered),
         kvp("passwordHash", passwordHash),
         kvp("updatedAt", now));
-    col.update_one(make_document(kvp("_id", oid)).view(),
-                   make_document(kvp("$set", setDoc.view())).view());
+    try {
+      auto updated = col.update_one(
+          make_document(
+              kvp("_id", oid), kvp("isActive", true),
+              kvp("$or", make_array(
+                  make_document(kvp("username", make_document(kvp("$exists", false)))),
+                  make_document(kvp("username", bsoncxx::types::b_null{})),
+                  make_document(kvp("username", ""))))),
+          make_document(kvp("$set", setDoc.view())));
+      if (!updated || updated->matched_count() != 1) {
+        throw std::runtime_error("Username already set for this user");
+      }
+    } catch (const mongocxx::operation_exception& dbError) {
+      if (dbError.code().value() == 11000)
+        throw std::runtime_error("Username already exists");
+      throw;
+    }
+    pulse::log::info("Username created for verified user");
 
     // Reflect the change locally for the session + response.
-    user["username"]     = username;
+    user["username"]     = lowered;
+    user["profile"]["displayName"] = lowered;
     user["passwordHash"] = passwordHash;
 
     Json::Value sessionResult = createUserSession(user, deviceInfo, ipAddress);
@@ -795,6 +886,16 @@ Json::Value AuthService::createUserSession(const Json::Value& user,
                                            const DeviceInfo& deviceInfo,
                                            const std::string& ipAddress) {
   try {
+    if (deviceInfo.deviceId.empty() || deviceInfo.deviceId.size() > 200) {
+      throw std::invalid_argument("Invalid device ID");
+    }
+    if (!pulse::models::session::isValidPlatform(deviceInfo.platform)) {
+      throw std::invalid_argument("Invalid device platform");
+    }
+    if (deviceName(deviceInfo).size() > 200 || appVersion(deviceInfo).size() > 64 ||
+        osVersion(deviceInfo).size() > 128) {
+      throw std::invalid_argument("Invalid device metadata");
+    }
     auto col = pulse::db::collection(pulse::models::session::kCollection);
     auto userOid = pulse::bsonjson::oid(docId(user));
 
@@ -810,7 +911,8 @@ Json::Value AuthService::createUserSession(const Json::Value& user,
     // Session timestamps.
     const auto nowMs = pulse::bsonjson::nowMillis();
     const auto now = dateFromMillis(nowMs);
-    const long long expiresAtMs = nowMs + 7LL * 24 * 60 * 60 * 1000;  // 7 days
+    const long long expiresAtMs = nowMs +
+        static_cast<long long>(pulse::jwt().refreshTokenTtlSeconds()) * 1000LL;
     const auto expiresAt = dateFromMillis(expiresAtMs);
 
     // Deactivate other active sessions for this user+device.
@@ -843,14 +945,13 @@ Json::Value AuthService::createUserSession(const Json::Value& user,
     auto inserted = col.insert_one(sessionDoc.view());
     if (!inserted) throw std::runtime_error("Failed to create session");
 
-    pulse::log::info("Session created for user {}, device: {}", docId(user),
-                     deviceInfo.deviceId);
+    pulse::log::info("User session created");
 
     Json::Value tokens(Json::objectValue);
     tokens["accessToken"]  = accessToken;
     tokens["refreshToken"] = refreshToken;
     tokens["tokenType"]    = "Bearer";
-    tokens["expiresIn"]    = 900;  // 15 minutes
+    tokens["expiresIn"]    = pulse::jwt().accessTokenTtlSeconds();
 
     Json::Value session(Json::objectValue);
     session["deviceId"]  = deviceInfo.deviceId;
@@ -880,21 +981,11 @@ Json::Value AuthService::refreshAccessToken(const std::string& refreshToken) {
 
     auto userOid = pulse::bsonjson::oid(decoded.userId);
 
-    // Find the active session (tokens stored hashed).
-    auto session = sessions.find_one(
-        make_document(
-            kvp("userId", userOid),
-            kvp("deviceId", decoded.deviceId),
-            kvp("refreshToken", hashToken(refreshToken)),
-            kvp("isActive", true),
-            kvp("expiresAt", make_document(kvp("$gt", nowDate()))))
-            .view());
-    if (!session) throw std::runtime_error("Invalid or expired refresh token");
-
-    Json::Value sessionDoc = pulse::bsonjson::toJson(session->view());
-
-    // Get the user.
-    auto userOpt = users.find_one(make_document(kvp("_id", userOid)).view());
+    // The user must still be active. REST and WebSocket authentication both
+    // depend on refresh never minting fresh credentials for a deleted/banned
+    // account.
+    auto userOpt = users.find_one(
+        make_document(kvp("_id", userOid), kvp("isActive", true)).view());
     if (!userOpt) throw std::runtime_error("User not found");
     Json::Value user = pulse::bsonjson::toJson(userOpt->view());
 
@@ -908,23 +999,32 @@ Json::Value AuthService::refreshAccessToken(const std::string& refreshToken) {
     rc.tokenId  = randomHex(16);
     const std::string newRefreshToken = pulse::jwt().generateRefreshToken(rc);
 
-    // Update the session (tokens stored hashed).
-    auto sessionId = pulse::bsonjson::oid(str(sessionDoc, "_id"));
+    // Atomically rotate the refresh hash. The old hash is part of the update
+    // predicate, so only one of several concurrent reuses can succeed.
     auto setDoc = make_document(
         kvp("accessToken", hashToken(newAccessToken)),
         kvp("refreshToken", hashToken(newRefreshToken)),
         kvp("lastActivity", nowDate()),
         kvp("updatedAt", nowDate()));
-    sessions.update_one(make_document(kvp("_id", sessionId)).view(),
-                        make_document(kvp("$set", setDoc.view())).view());
+    mongocxx::options::find_one_and_update rotateOpts{};
+    rotateOpts.return_document(mongocxx::options::return_document::k_after);
+    auto rotated = sessions.find_one_and_update(
+        make_document(
+            kvp("userId", userOid),
+            kvp("deviceId", decoded.deviceId),
+            kvp("refreshToken", hashToken(refreshToken)),
+            kvp("isActive", true),
+            kvp("expiresAt", make_document(kvp("$gt", nowDate())))),
+        make_document(kvp("$set", setDoc.view())), rotateOpts);
+    if (!rotated) throw std::runtime_error("Invalid or expired refresh token");
 
-    pulse::log::info("Tokens refreshed for user {}", docId(user));
+    pulse::log::info("User tokens refreshed");
 
     Json::Value tokens(Json::objectValue);
     tokens["accessToken"]  = newAccessToken;
     tokens["refreshToken"] = newRefreshToken;
     tokens["tokenType"]    = "Bearer";
-    tokens["expiresIn"]    = 900;  // 15 minutes
+    tokens["expiresIn"]    = pulse::jwt().accessTokenTtlSeconds();
 
     Json::Value out(Json::objectValue);
     out["success"] = true;
@@ -994,8 +1094,7 @@ Json::Value AuthService::resendOTP(const std::string& identifier,
     out["success"]    = true;
     out["method"]     = method;
     out["identifier"] = identifier;
-    out["purpose"]    = purpose;
-    out["message"]    = "OTP resent to " + identifier;
+    out["message"]    = "If the identifier is valid, an OTP has been sent";
     return out;
   } catch (const std::exception& e) {
     pulse::log::error("Resend OTP error: {}", e.what());
@@ -1052,16 +1151,17 @@ Json::Value AuthService::logoutUser(const std::string& userId,
                                       kvp("updatedAt", nowDate()))))
             .view());
 
-    // Revoke the access token immediately (TTL == max token life, 900s).
+    // Revoke the access token immediately for its configured maximum lifetime.
     if (!accessToken.empty()) {
       try {
-        pulse::cache().set("revoked_token:" + hashToken(accessToken), "1", 900);
+        pulse::cache().set("revoked_token:" + hashToken(accessToken), "1",
+                           pulse::jwt().accessTokenTtlSeconds());
       } catch (const std::exception& e) {
         pulse::log::warn("Token revocation cache write failed: {}", e.what());
       }
     }
 
-    pulse::log::info("User {} logged out from device: {}", userId, deviceId);
+    pulse::log::info("User session logged out");
 
     Json::Value out(Json::objectValue);
     out["success"] = true;
