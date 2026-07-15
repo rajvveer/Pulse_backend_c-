@@ -5,13 +5,47 @@
 #include <bsoncxx/builder/basic/array.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <chrono>
+#include <cctype>
 #include <ctime>
 #include <cstdio>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace pulse::bsonjson {
 
 using bsoncxx::type;
 namespace bld = bsoncxx::builder::basic;
+
+namespace {
+
+std::string iso8601FromMillis(int64_t millis) {
+  // C++ division truncates toward zero. Normalize negative epochs so the
+  // seconds and millisecond remainder still describe the same instant.
+  int64_t seconds = millis / 1000;
+  int64_t remainder = millis % 1000;
+  if (remainder < 0) {
+    remainder += 1000;
+    --seconds;
+  }
+
+  const std::time_t t = static_cast<std::time_t>(seconds);
+  std::tm tm{};
+#if defined(_WIN32)
+  gmtime_s(&tm, &t);
+#else
+  gmtime_r(&t, &tm);
+#endif
+
+  char date[24]{};
+  std::strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &tm);
+  char result[32]{};
+  std::snprintf(result, sizeof(result), "%s.%03lldZ", date,
+                static_cast<long long>(remainder));
+  return std::string(result);
+}
+
+} // namespace
 
 Json::Value valueToJson(const bsoncxx::types::bson_value::view& v) {
   switch (v.type()) {
@@ -23,16 +57,7 @@ Json::Value valueToJson(const bsoncxx::types::bson_value::view& v) {
     case type::k_oid:     return Json::Value(v.get_oid().value.to_string());
     case type::k_date: {
       // ISO-8601 UTC (matches Mongoose Date serialization).
-      std::time_t t = static_cast<std::time_t>(v.get_date().to_int64() / 1000);
-      std::tm tm{};
-#if defined(_WIN32)
-      gmtime_s(&tm, &t);
-#else
-      gmtime_r(&t, &tm);
-#endif
-      char buf[32];
-      std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &tm);
-      return Json::Value(std::string(buf));
+      return Json::Value(iso8601FromMillis(v.get_date().to_int64()));
     }
     case type::k_null:       return Json::Value(Json::nullValue);
     case type::k_document:   return toJson(v.get_document().value);
@@ -57,14 +82,25 @@ Json::Value toJson(const bsoncxx::array::view& arr) {
 }
 
 namespace {
-void appendJson(bld::sub_document& sub, const std::string& key, const Json::Value& v);
 void appendJsonArray(bld::sub_array& sub, const Json::Value& v);
 
-void appendValue(bld::sub_document& sub, const std::string& key, const Json::Value& v) {
+int64_t checkedUnsigned(const Json::Value& value) {
+  const auto unsignedValue = value.asUInt64();
+  if (unsignedValue > static_cast<Json::UInt64>(
+                          std::numeric_limits<int64_t>::max())) {
+    throw std::overflow_error("JSON unsigned integer exceeds BSON int64 range");
+  }
+  return static_cast<int64_t>(unsignedValue);
+}
+
+// basic::document and basic::sub_document both expose append(). Keeping this
+// helper generic makes the top-level conversion type-safe.
+template <typename DocumentBuilder>
+void appendValue(DocumentBuilder& sub, const std::string& key, const Json::Value& v) {
   switch (v.type()) {
     case Json::nullValue:   sub.append(bld::kvp(key, bsoncxx::types::b_null{})); break;
     case Json::intValue:    sub.append(bld::kvp(key, static_cast<int64_t>(v.asInt64()))); break;
-    case Json::uintValue:   sub.append(bld::kvp(key, static_cast<int64_t>(v.asUInt64()))); break;
+    case Json::uintValue:   sub.append(bld::kvp(key, checkedUnsigned(v))); break;
     case Json::realValue:   sub.append(bld::kvp(key, v.asDouble())); break;
     case Json::stringValue: sub.append(bld::kvp(key, v.asString())); break;
     case Json::booleanValue:sub.append(bld::kvp(key, v.asBool())); break;
@@ -83,7 +119,7 @@ void appendJsonArray(bld::sub_array& a, const Json::Value& v) {
   switch (v.type()) {
     case Json::nullValue:   a.append(bsoncxx::types::b_null{}); break;
     case Json::intValue:    a.append(static_cast<int64_t>(v.asInt64())); break;
-    case Json::uintValue:   a.append(static_cast<int64_t>(v.asUInt64())); break;
+    case Json::uintValue:   a.append(checkedUnsigned(v)); break;
     case Json::realValue:   a.append(v.asDouble()); break;
     case Json::stringValue: a.append(v.asString()); break;
     case Json::booleanValue:a.append(v.asBool()); break;
@@ -97,9 +133,7 @@ bsoncxx::document::value fromJson(const Json::Value& v) {
   bld::document doc;
   if (v.isObject()) {
     for (const auto& k : v.getMemberNames()) {
-      bld::sub_document* dummy = nullptr; (void)dummy;
-      // Append each top-level key.
-      appendValue(reinterpret_cast<bld::sub_document&>(doc), k, v[k]);
+      appendValue(doc, k, v[k]);
     }
   }
   return doc.extract();
@@ -126,16 +160,7 @@ long long nowMillis() {
 }
 
 std::string nowIso8601() {
-  std::time_t t = static_cast<std::time_t>(nowMillis() / 1000);
-  std::tm tm{};
-#if defined(_WIN32)
-  gmtime_s(&tm, &t);
-#else
-  gmtime_r(&t, &tm);
-#endif
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S.000Z", &tm);
-  return std::string(buf);
+  return iso8601FromMillis(nowMillis());
 }
 
 } // namespace pulse::bsonjson

@@ -36,6 +36,24 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
+# mongo-cxx-driver target names depend on whether the active vcpkg triplet is
+# dynamic (Windows) or static (the default x64-linux Docker triplet).
+if(TARGET mongo::mongocxx_shared)
+  set(PULSE_MONGOCXX_TARGET mongo::mongocxx_shared)
+elseif(TARGET mongo::mongocxx_static)
+  set(PULSE_MONGOCXX_TARGET mongo::mongocxx_static)
+else()
+  message(FATAL_ERROR "mongocxx target not found")
+endif()
+
+if(TARGET mongo::bsoncxx_shared)
+  set(PULSE_BSONCXX_TARGET mongo::bsoncxx_shared)
+elseif(TARGET mongo::bsoncxx_static)
+  set(PULSE_BSONCXX_TARGET mongo::bsoncxx_static)
+else()
+  message(FATAL_ERROR "bsoncxx target not found")
+endif()
+
 # redis-plus-plus exports either redis++::redis++ (shared) or redis++::redis++_static
 # depending on how vcpkg built it. Pick whichever target this install provides.
 if(TARGET redis++::redis++)
@@ -117,8 +135,8 @@ target_include_directories(pulse_backend BEFORE PRIVATE
 
 target_link_libraries(pulse_backend PRIVATE
   Drogon::Drogon
-  mongo::mongocxx_shared
-  mongo::bsoncxx_shared
+  ${PULSE_MONGOCXX_TARGET}
+  ${PULSE_BSONCXX_TARGET}
   ${PULSE_REDISPP_TARGET}
   jwt-cpp::jwt-cpp
   OpenSSL::SSL
