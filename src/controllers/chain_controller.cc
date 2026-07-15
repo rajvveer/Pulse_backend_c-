@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <cstdlib>
 #include <exception>
 #include <optional>
 #include <string>
@@ -82,38 +81,28 @@ int toIntCast(const Json::Value& v, int dflt) {
 }
 
 // JS parseInt(str, 10): optional leading sign + digits, NaN (nullopt) on none.
-std::optional<long> jsParseInt(const std::string& s) {
+std::optional<long long> jsParseInt(const std::string& s) {
   size_t i = 0;
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
-  bool neg = false;
+  const size_t numberStart = i;
   if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-    neg = (s[i] == '-');
     ++i;
   }
-  size_t start = i;
-  long value = 0;
-  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
-    value = value * 10 + (s[i] - '0');
-    ++i;
+  const size_t digitsStart = i;
+  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+  if (i == digitsStart) return std::nullopt;
+  try {
+    return std::stoll(s.substr(numberStart, i - numberStart));
+  } catch (...) {
+    return std::nullopt;
   }
-  if (i == start) return std::nullopt;
-  return neg ? -value : value;
 }
 
-// JS Number(str) for the page coercion in (page - 1) * limit. An all-numeric
-// (optionally signed/decimal) string converts; anything else is NaN. We only
-// need integer-ish pagination values, so fall back to 0 on NaN (the multiply
-// then yields a NaN-safe skip of 0, which mongocxx clamps).
-double jsNumber(const std::string& s) {
-  if (s.empty()) return 0.0;  // Number('') === 0
-  errno = 0;
-  char* end = nullptr;
-  double v = std::strtod(s.c_str(), &end);
-  // Number requires the WHOLE string to be a valid number (ignoring surrounding
-  // whitespace); trailing garbage => NaN. Approximate with full-consume check.
-  while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
-  if (end == s.c_str() || (end && *end != '\0')) return 0.0;
-  return v;
+long long clampedParam(const std::string& raw, long long fallback,
+                       long long lo, long long hi) {
+  auto parsed = jsParseInt(raw);
+  long long value = (!parsed || *parsed == 0) ? fallback : *parsed;
+  return std::max(lo, std::min(hi, value));
 }
 
 // The Express try/catch fallback for every handler:
@@ -232,12 +221,9 @@ void ChainController::getChains(
     if (!genre.empty()) filter.append(kvp("genre", genre));
 
     // .skip((page - 1) * limit) — JS numeric coercion of the raw query strings.
-    const double pageNum = jsNumber(pageRaw);
-    const double limitNum = jsNumber(limitRaw);
-    long long skip = static_cast<long long>((pageNum - 1.0) * limitNum);
-    if (skip < 0) skip = 0;
-    // .limit(parseInt(limit))
-    long limit = jsParseInt(limitRaw).value_or(0);
+    const long long page = clampedParam(pageRaw, 1, 1, 10000);
+    const long long limit = clampedParam(limitRaw, 20, 1, 100);
+    const long long skip = (page - 1) * limit;
 
     mongocxx::options::find opts{};
     opts.sort(make_document(kvp("likes", -1), kvp("contributorCount", -1)));
@@ -617,32 +603,61 @@ void ChainController::voteSegment(
 
     const std::string userId = authedUserId(req);
 
-    bsoncxx::oid chainOid;
-    try {
-      chainOid = pulse::bsonjson::oid(chainId);
-    } catch (const std::exception&) {
-      callback(serverErrorWithMessage(
-          "Cast to ObjectId failed for value \"" + chainId +
-          "\" (type string) at path \"_id\" for model \"ChainStory\""));
+    auto chainOid = pulse::bsonjson::tryOid(chainId);
+    auto segmentOid = pulse::bsonjson::tryOid(segmentId);
+    auto userOid = pulse::bsonjson::tryOid(userId);
+    if (!chainOid || !segmentOid || !userOid) {
+      callback(failWith(drogon::k400BadRequest,
+                        "Invalid chain, segment, or user id"));
       return;
     }
 
-    // if (!chain) -> 404 'Chain not found' (before the instance method).
+    Json::Value chain;
     {
       auto col = pulse::db::collection(chainstory::kCollection);
-      if (!col.find_one(make_document(kvp("_id", chainOid)))) {
+      auto found = col.find_one(make_document(kvp("_id", *chainOid)));
+      if (!found) {
         callback(failWith(drogon::k404NotFound, "Chain not found"));
         return;
       }
+      chain = pulse::bsonjson::toJson(found->view());
     }
 
     // chain.voteOnSegment(segmentId, userId, value) — model owns the
     // 'Segment not found' throw (-> catch -> 500 with the message).
-    bsoncxx::oid segmentOid = pulse::bsonjson::oid(segmentId);
-    bsoncxx::oid userOid = pulse::bsonjson::oid(userId);
+    const std::string canonicalSegmentId = segmentOid->to_string();
+    const std::string canonicalUserId = userOid->to_string();
+    const Json::Value* pendingSegment = nullptr;
+    if (chain.isMember("pendingSegments") && chain["pendingSegments"].isArray()) {
+      for (const auto& segment : chain["pendingSegments"]) {
+        if (refHex(segment["_id"]) == canonicalSegmentId) {
+          pendingSegment = &segment;
+          break;
+        }
+      }
+    }
+    if (!pendingSegment) {
+      callback(failWith(drogon::k404NotFound, "Segment not found"));
+      return;
+    }
+
+    // Identical retries must not count as additional votes.
+    if (pendingSegment->isMember("voters") &&
+        (*pendingSegment)["voters"].isArray()) {
+      for (const auto& voter : (*pendingSegment)["voters"]) {
+        if (refHex(voter["user"]) == canonicalUserId &&
+            voter.get("value", 0).asInt() == value) {
+          Json::Value data(Json::objectValue);
+          data["votes"] = pendingSegment->get("votes", 0).asInt();
+          data["approved"] = pendingSegment->get("isApproved", false).asBool();
+          callback(okData(std::move(data)));
+          return;
+        }
+      }
+    }
 
     chainstory::VoteResult result =
-        chainstory::voteOnSegment(chainOid, segmentOid, userOid, value);
+        chainstory::voteOnSegment(*chainOid, *segmentOid, *userOid, value);
 
     // res.json({ success:true, data: { votes, approved } });
     Json::Value data(Json::objectValue);
@@ -668,28 +683,82 @@ void ChainController::likeChain(
   try {
     const std::string userId = authedUserId(req);
 
-    bsoncxx::oid chainOid;
-    try {
-      chainOid = pulse::bsonjson::oid(chainId);
-    } catch (const std::exception&) {
-      callback(serverErrorWithMessage(
-          "Cast to ObjectId failed for value \"" + chainId +
-          "\" (type string) at path \"_id\" for model \"ChainStory\""));
+    auto chainOid = pulse::bsonjson::tryOid(chainId);
+    auto userOid = pulse::bsonjson::tryOid(userId);
+    if (!chainOid || !userOid) {
+      callback(failWith(drogon::k400BadRequest, "Invalid chain or user id"));
       return;
     }
 
     // if (!chain) -> 404 'Chain not found' (before the instance method).
+    auto chains = pulse::db::collection(chainstory::kCollection);
     {
-      auto col = pulse::db::collection(chainstory::kCollection);
-      if (!col.find_one(make_document(kvp("_id", chainOid)))) {
+      if (!chains.find_one(make_document(kvp("_id", *chainOid)))) {
         callback(failWith(drogon::k404NotFound, "Chain not found"));
         return;
       }
     }
 
-    // chain.toggleLike(userId) -> new like count.
-    bsoncxx::oid userOid = pulse::bsonjson::oid(userId);
-    long long likes = chainstory::toggleLike(chainOid, userOid);
+    // Persist per-user state in a deterministic _id ledger. The _id uniqueness
+    // makes duplicate concurrent requests unable to increment the counter more
+    // than once, while still providing true toggle semantics.
+    auto chainLikes = pulse::db::collection("chainlikes");
+    const std::string likeKey =
+        chainOid->to_string() + ":" + userOid->to_string();
+    auto deleted =
+        chainLikes.delete_one(make_document(kvp("_id", likeKey)));
+
+    if (deleted && deleted->deleted_count() == 1) {
+      chains.update_one(
+          make_document(kvp("_id", *chainOid),
+                        kvp("likes", make_document(kvp("$gt", 0)))),
+          make_document(
+              kvp("$inc", make_document(kvp("likes", -1), kvp("__v", 1))),
+              kvp("$set", make_document(kvp(
+                  "updatedAt", bsoncxx::types::b_date{
+                                   std::chrono::system_clock::now()})))));
+    } else {
+      bool inserted = false;
+      try {
+        bld::document tracker;
+        tracker.append(kvp("_id", likeKey));
+        tracker.append(kvp("chain", *chainOid));
+        tracker.append(kvp("user", *userOid));
+        tracker.append(kvp("createdAt", bsoncxx::types::b_date{
+                                           std::chrono::system_clock::now()}));
+        chainLikes.insert_one(tracker.view());
+        inserted = true;
+      } catch (const std::exception&) {
+        // A concurrent insert of the same deterministic key is already the
+        // desired liked state. Propagate unrelated failures.
+        if (!chainLikes.find_one(make_document(kvp("_id", likeKey)))) throw;
+      }
+
+      if (inserted) {
+        auto updated = chains.update_one(
+            make_document(kvp("_id", *chainOid)),
+            make_document(
+                kvp("$inc", make_document(kvp("likes", 1), kvp("__v", 1))),
+                kvp("$set", make_document(kvp(
+                    "updatedAt", bsoncxx::types::b_date{
+                                     std::chrono::system_clock::now()})))));
+        if (!updated || updated->matched_count() == 0) {
+          chainLikes.delete_one(make_document(kvp("_id", likeKey)));
+          callback(failWith(drogon::k404NotFound, "Chain not found"));
+          return;
+        }
+      }
+    }
+
+    mongocxx::options::find likesOpts{};
+    likesOpts.projection(make_document(kvp("likes", 1)));
+    auto current = chains.find_one(make_document(kvp("_id", *chainOid)), likesOpts);
+    if (!current) {
+      callback(failWith(drogon::k404NotFound, "Chain not found"));
+      return;
+    }
+    Json::Value currentJson = pulse::bsonjson::toJson(current->view());
+    long long likes = currentJson.get("likes", 0).asInt64();
 
     // res.json({ success:true, data: { likes } });
     Json::Value data(Json::objectValue);

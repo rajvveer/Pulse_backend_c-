@@ -44,6 +44,8 @@ using pulse::bsonjson::nowIso8601;
 
 namespace {
 
+constexpr int kMaxCasRetries = 8;
+
 bsoncxx::types::b_date nowDate() {
   return bsoncxx::types::b_date{std::chrono::system_clock::now()};
 }
@@ -199,9 +201,9 @@ std::optional<Json::Value> loadChain(mongocxx::collection& col,
   return pulse::bsonjson::toJson(found->view());
 }
 
-// Persist a Json chain document back to Mongo with replace_one, refreshing
-// updatedAt (timestamps: true on save()).
-void saveChain(mongocxx::collection& col, const bsoncxx::oid& chainId,
+// Persist a Json chain document with an optimistic __v compare-and-swap.
+// Returns false when another writer won and the caller must reload/reapply.
+bool saveChain(mongocxx::collection& col, const bsoncxx::oid& chainId,
                Json::Value doc) {
   // Build the typed BSON and overwrite createdAt with the existing value when
   // present, plus a fresh updatedAt — mirroring Mongoose save() with timestamps.
@@ -255,10 +257,21 @@ void saveChain(mongocxx::collection& col, const bsoncxx::oid& chainId,
                  doc.isMember("createdAt") ? parseIsoDate(doc["createdAt"]) : nowDate()));
   out.append(kvp("updatedAt", nowDate()));
 
-  if (doc.isMember("__v") && doc["__v"].isNumeric())
-    out.append(kvp("__v", asInt(doc["__v"])));
+  const bool hasVersion = doc.isMember("__v") && doc["__v"].isNumeric();
+  const int expectedVersion = hasVersion ? asInt(doc["__v"]) : 0;
+  out.append(kvp("__v", expectedVersion + 1));
 
-  col.replace_one(make_document(kvp("_id", chainId)), out.extract());
+  bld::document filter;
+  filter.append(kvp("_id", chainId));
+  if (hasVersion) {
+    filter.append(kvp("__v", expectedVersion));
+  } else {
+    // Tolerate legacy documents created before the version key was persisted.
+    filter.append(kvp("__v", make_document(kvp("$exists", false))));
+  }
+
+  auto result = col.replace_one(filter.view(), out.extract());
+  return result && result->matched_count() == 1;
 }
 
 } // namespace
@@ -443,23 +456,6 @@ Json::Value submitSegment(const bsoncxx::oid& chainId,
                           const std::optional<std::string>& media) {
   auto col = pulse::db::collection(kCollection);
 
-  auto loaded = loadChain(col, chainId);
-  if (!loaded) throw std::runtime_error("Chain not found");
-  Json::Value chain = *loaded;
-
-  // if (this.status !== 'active') throw ...
-  const std::string status =
-      chain.isMember("status") && chain["status"].isString()
-          ? chain["status"].asString() : "active";
-  if (status != "active")
-    throw std::runtime_error("This chain is no longer accepting submissions");
-
-  // if (this.segmentCount >= this.maxSegments) throw ...
-  const int segmentCount = chain.isMember("segmentCount") ? chain["segmentCount"].asInt() : 0;
-  const int maxSegments = chain.isMember("maxSegments") ? chain["maxSegments"].asInt() : 50;
-  if (segmentCount >= maxSegments)
-    throw std::runtime_error("This chain has reached maximum segments");
-
   // mediaType = media ? (media.includes('.mp4') ? 'video' : 'image') : 'none'
   std::string mediaType = "none";
   if (media && !media->empty()) {
@@ -474,16 +470,36 @@ Json::Value submitSegment(const bsoncxx::oid& chainId,
   else segment["media"] = Json::Value(Json::nullValue);
   segment["mediaType"] = mediaType;
   segment = applySegmentDefaults(segment);
+  // Give the subdocument a stable identity across CAS retries.
+  segment["_id"] = bsoncxx::oid{}.to_string();
 
-  // this.pendingSegments.push(segment); await this.save();
-  if (!chain.isMember("pendingSegments") || !chain["pendingSegments"].isArray())
-    chain["pendingSegments"] = Json::Value(Json::arrayValue);
-  chain["pendingSegments"].append(segment);
+  for (int attempt = 0; attempt < kMaxCasRetries; ++attempt) {
+    auto loaded = loadChain(col, chainId);
+    if (!loaded) throw std::runtime_error("Chain not found");
+    Json::Value chain = *loaded;
 
-  saveChain(col, chainId, chain);
+    const std::string status =
+        chain.isMember("status") && chain["status"].isString()
+            ? chain["status"].asString() : "active";
+    if (status != "active")
+      throw std::runtime_error("This chain is no longer accepting submissions");
 
-  // return segment;
-  return segment;
+    const int segmentCount =
+        chain.isMember("segmentCount") ? chain["segmentCount"].asInt() : 0;
+    const int maxSegments =
+        chain.isMember("maxSegments") ? chain["maxSegments"].asInt() : 50;
+    if (segmentCount >= maxSegments)
+      throw std::runtime_error("This chain has reached maximum segments");
+
+    if (!chain.isMember("pendingSegments") ||
+        !chain["pendingSegments"].isArray())
+      chain["pendingSegments"] = Json::Value(Json::arrayValue);
+    chain["pendingSegments"].append(segment);
+
+    if (saveChain(col, chainId, std::move(chain))) return segment;
+  }
+
+  throw std::runtime_error("Chain was modified concurrently; please retry");
 }
 
 VoteResult voteOnSegment(const bsoncxx::oid& chainId,
@@ -491,6 +507,8 @@ VoteResult voteOnSegment(const bsoncxx::oid& chainId,
                          const bsoncxx::oid& userId,
                          int value) {
   auto col = pulse::db::collection(kCollection);
+
+  for (int attempt = 0; attempt < kMaxCasRetries; ++attempt) {
 
   auto loaded = loadChain(col, chainId);
   if (!loaded) throw std::runtime_error("Chain not found");
@@ -598,13 +616,16 @@ VoteResult voteOnSegment(const bsoncxx::oid& chainId,
   chain["totalVotes"] =
       (chain.isMember("totalVotes") ? chain["totalVotes"].asInt() : 0) + 1;
 
-  saveChain(col, chainId, chain);
+  if (!saveChain(col, chainId, std::move(chain))) continue;
 
   // return { votes: segment.votes, approved: segment.isApproved };
   VoteResult result;
   result.votes = votes;
   result.approved = isApproved;
   return result;
+  }
+
+  throw std::runtime_error("Chain was modified concurrently; please retry");
 }
 
 long long toggleLike(const bsoncxx::oid& chainId, const bsoncxx::oid& /*userId*/) {
@@ -612,7 +633,9 @@ long long toggleLike(const bsoncxx::oid& chainId, const bsoncxx::oid& /*userId*/
 
   // this.likes++; await this.save(); return this.likes;
   // Faithful, race-safe equivalent: $inc likes by 1 and read back the new value.
-  auto update = make_document(kvp("$inc", make_document(kvp("likes", 1))));
+  auto update = make_document(
+      kvp("$inc", make_document(kvp("likes", 1), kvp("__v", 1))),
+      kvp("$set", make_document(kvp("updatedAt", nowDate()))));
 
   mongocxx::options::find_one_and_update fo{};
   fo.return_document(mongocxx::options::return_document::k_after);
