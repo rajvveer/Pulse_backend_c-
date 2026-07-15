@@ -31,7 +31,9 @@ public:
 
   // Register a new socket for a user. Returns true if the user JUST came online
   // (this was their first connected socket), so the caller can notify peers.
-  bool addConnection(const std::string& userId);
+  // `registered` becomes true only once the Redis counter increment succeeds,
+  // preventing an unmatched decrement after a failed registration.
+  bool addConnection(const std::string& userId, bool& registered);
 
   // De-register a socket for a user. Returns true if the user just went OFFLINE
   // (their last socket disconnected).

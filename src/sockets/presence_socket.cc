@@ -14,6 +14,8 @@
 #include "pulse/logger.hpp"
 #include "pulse/models/conversation.hpp"
 #include "pulse/services/presence_service.hpp"
+#include "pulse/filters/auth_filters.hpp"
+#include "pulse/config.hpp"
 
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
@@ -22,11 +24,15 @@
 #include <sw/redis++/redis++.h>
 
 #include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <thread>
 
 using namespace drogon;
 
 namespace pulse::sockets {
+
+std::atomic<PresenceHub*> PresenceHub::activeHub_{nullptr};
 
 namespace {
 
@@ -50,14 +56,24 @@ std::string frame(const std::string& event, const Json::Value& data) {
 // Mirrors server.js handshake auth (which used handshake.auth.token) adapted to
 // the raw WS handshake per the porting task.
 std::string extractToken(const HttpRequestPtr& req) {
-    std::string token = req->getParameter("token");
-    if (!token.empty()) return token;
-
     std::string auth = req->getHeader("authorization");
     if (auth.empty()) auth = req->getHeader("Authorization");
     const std::string bearer = "Bearer ";
     if (auth.rfind(bearer, 0) == 0) return auth.substr(bearer.size());
-    return auth;  // tolerate a bare token in the header, as the JS path did not
+    return req->getParameter("token");
+}
+
+std::size_t maxConnectionsPerUser() {
+    static const auto value = static_cast<std::size_t>(std::clamp<int64_t>(
+        pulse::config().envInt("WS_MAX_CONNECTIONS_PER_USER", 10), 1, 100));
+    return value;
+}
+
+std::size_t maxInboundFrameBytes() {
+    static const auto value = static_cast<std::size_t>(std::clamp<int64_t>(
+        pulse::config().envInt("WS_MAX_FRAME_BYTES", 64 * 1024),
+        1024, 1024 * 1024));
+    return value;
 }
 
 }  // namespace
@@ -70,43 +86,144 @@ PresenceHub& PresenceHub::instance() {
 }
 
 PresenceHub::PresenceHub() {
+    activeHub_.store(this);
     try {
         pub_ = pulse::cache().createClient();
     } catch (const std::exception& e) {
         pulse::log::error("\xE2\x9D\x8C Presence pub client init failed: {}", e.what());
     }
     startSubscriber();
+    startAuthMonitor();
+}
+
+PresenceHub::~PresenceHub() {
+    shutdownInfrastructure();
+    PresenceHub* expected = this;
+    activeHub_.compare_exchange_strong(expected, nullptr);
+}
+
+void PresenceHub::shutdownExistingInfrastructure() {
+    if (auto* hub = activeHub_.load()) hub->shutdownInfrastructure();
+}
+
+void PresenceHub::shutdownInfrastructure() {
+    std::unordered_set<WebSocketConnectionPtr> sockets;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        for (const auto& entry : rooms_)
+            sockets.insert(entry.second.begin(), entry.second.end());
+    }
+    for (const auto& socket : sockets) {
+        if (socket && socket->connected())
+            socket->shutdown(CloseCode::kEndpointGone, "Server shutting down");
+    }
+    stopAuthMonitor();
+    stopSubscriber();
 }
 
 void PresenceHub::startSubscriber() {
-    try {
-        sub_ = pulse::cache().createClient();
-    } catch (const std::exception& e) {
-        pulse::log::error("\xE2\x9D\x8C Presence sub client init failed: {}", e.what());
-        return;
-    }
-
-    // redis-plus-plus Subscriber owns a dedicated connection; consume() blocks,
-    // so it runs on its own detached thread for the life of the process. The
-    // captured shared_ptr keeps the subscriber's underlying Redis alive.
-    auto sub = sub_;
-    std::thread([this, sub]() {
-        for (;;) {
+    if (subRunning_.exchange(true)) return;
+    subThread_ = std::thread([this]() {
+        while (subRunning_) {
             try {
+                auto sub = pulse::cache().createClient();
+                sub_ = sub;
                 auto subscriber = sub->subscriber();
                 subscriber.on_message(
                     [this](std::string /*channel*/, std::string msg) {
                         handlePublished(msg);
                     });
                 subscriber.subscribe(kChannel);
-                for (;;) subscriber.consume();
+                while (subRunning_) subscriber.consume();
+            } catch (const sw::redis::TimeoutError&) {
+                if (!subRunning_) break;
             } catch (const std::exception& e) {
-                pulse::log::warn("\xE2\x9A\xA0\xEF\xB8\x8F  Presence subscriber dropped: {} — reconnecting",
+                if (!subRunning_) break;
+                pulse::log::warn("Presence subscriber dropped: {} — reconnecting",
                                  e.what());
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                for (int i = 0; i < 10 && subRunning_; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
-    }).detach();
+    });
+}
+
+void PresenceHub::stopSubscriber() {
+    if (!subRunning_.exchange(false)) return;
+    try {
+        if (pub_) {
+            Json::Value wake(Json::objectValue);
+            wake["room"] = "__shutdown";
+            wake["except"] = "";
+            wake["events"] = Json::Value(Json::arrayValue);
+            wake["data"] = Json::Value(Json::objectValue);
+            Json::StreamWriterBuilder writer;
+            writer["indentation"] = "";
+            pub_->publish(kChannel, Json::writeString(writer, wake));
+        }
+    } catch (...) {
+    }
+    if (subThread_.joinable()) subThread_.join();
+    sub_.reset();
+}
+
+void PresenceHub::startAuthMonitor() {
+    if (authRunning_.exchange(true)) return;
+    authThread_ = std::thread([this] {
+        const auto interval = std::chrono::seconds(std::max<int64_t>(
+            5, std::min<int64_t>(300,
+                pulse::config().envInt("WS_AUTH_RECHECK_SEC", 30))));
+        std::unique_lock<std::mutex> waitLock(authWaitMu_);
+        while (authRunning_) {
+            if (authWaitCv_.wait_for(
+                    waitLock, interval,
+                    [this] { return !authRunning_.load(); })) break;
+            waitLock.unlock();
+
+            std::unordered_set<WebSocketConnectionPtr> unique;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                for (const auto& entry : rooms_)
+                    unique.insert(entry.second.begin(), entry.second.end());
+            }
+            for (const auto& socket : unique) {
+                auto ctx = socket ? socket->getContext<PresenceContext>() : nullptr;
+                if (!ctx) continue;
+                AccessClaims claims;
+                if (pulse::filters::validateAccessToken(ctx->accessToken, claims) !=
+                        pulse::filters::AccessTokenStatus::Valid ||
+                    claims.userId != ctx->userId) {
+                    socket->shutdown(CloseCode::kViolation,
+                                     "Authentication expired or revoked");
+                } else if (ctx->presenceRegistered.load()) {
+                    pulse::presence().touch(ctx->userId);
+                }
+            }
+            waitLock.lock();
+        }
+    });
+}
+
+void PresenceHub::stopAuthMonitor() {
+    if (!authRunning_.exchange(false)) return;
+    authWaitCv_.notify_all();
+    if (authThread_.joinable()) authThread_.join();
+}
+
+bool PresenceHub::registerConnection(
+    const std::string& userId, const WebSocketConnectionPtr& conn,
+    std::size_t maxPerUser) {
+    if (userId.empty() || !conn || maxPerUser == 0) return false;
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (connUsers_.find(conn) != connUsers_.end()) return true;
+    std::size_t& count = userConnCount_[userId];
+    if (count >= maxPerUser) {
+        if (count == 0) userConnCount_.erase(userId);
+        return false;
+    }
+    ++count;
+    connUsers_.emplace(conn, userId);
+    return true;
 }
 
 void PresenceHub::addToRoom(const std::string& room,
@@ -133,6 +250,16 @@ void PresenceHub::dropConnection(const WebSocketConnectionPtr& conn) {
         else
             ++it;
     }
+    auto userIt = connUsers_.find(conn);
+    if (userIt == connUsers_.end()) return;
+    auto countIt = userConnCount_.find(userIt->second);
+    if (countIt != userConnCount_.end()) {
+        if (countIt->second <= 1)
+            userConnCount_.erase(countIt);
+        else
+            --countIt->second;
+    }
+    connUsers_.erase(userIt);
 }
 
 void PresenceHub::emitLocal(const std::string& room,
@@ -250,39 +377,78 @@ void PresenceSocket::handleNewConnection(const HttpRequestPtr& req,
     }
 
     std::string userId;
-    try {
-        // Same verification path as REST: pinned algorithm, issuer, audience,
-        // and token type — a refresh or temp token cannot open a socket.
-        AccessClaims claims = pulse::jwt().verifyAccessToken(token);
-        userId = claims.userId;
-    } catch (const std::exception& err) {
-        pulse::log::warn("\xE2\x9B\x94 Socket connection rejected \xE2\x80\x94 {}", err.what());
-        conn->shutdown(CloseCode::kViolation,
-                       std::string("Authentication failed: ") + err.what());
+    AccessClaims claims;
+    if (pulse::filters::validateAccessToken(token, claims) !=
+        pulse::filters::AccessTokenStatus::Valid) {
+        pulse::log::warn(
+            "Socket connection rejected - invalid/revoked token or inactive session");
+        conn->shutdown(CloseCode::kViolation, "Authentication failed");
         return;
     }
+    userId = claims.userId;
 
     auto ctx = std::make_shared<PresenceContext>();
     ctx->userId = userId;
+    ctx->accessToken = token;
     conn->setContext(ctx);
+
+    auto& hub = PresenceHub::instance();
+    const std::size_t cap = maxConnectionsPerUser();
+    if (!hub.registerConnection(userId, conn, cap)) {
+        pulse::log::warn("Presence socket rejected - user at connection cap ({})",
+                         cap);
+        conn->setContext(nullptr);
+        conn->shutdown(CloseCode::kViolation, "Connection limit reached");
+        return;
+    }
 
     // server.js io.on('connection'): always join the user's own room so server
     // code can target a specific user regardless of which worker they are on.
     const std::string userRoom = "user_" + userId;
-    PresenceHub::instance().addToRoom(userRoom, conn);
+    hub.addToRoom(userRoom, conn);
     ctx->rooms.insert(userRoom);
+
+    // Every accepted socket owns exactly one Redis presence registration.
+    bool registered = false;
+    const bool justCameOnline =
+        pulse::presence().addConnection(userId, registered);
+    ctx->presenceRegistered.store(registered);
+    if (justCameOnline) notifyConversationPeers(userId, true);
 }
 
 void PresenceSocket::handleNewMessage(const WebSocketConnectionPtr& conn,
                                       std::string&& message,
                                       const WebSocketMessageType& type) {
+    auto ctx = conn->getContext<PresenceContext>();
+    if (!ctx) return;
+
+    // Control frames are handled by the transport and require no DB lookup.
     if (type == WebSocketMessageType::Ping ||
         type == WebSocketMessageType::Pong ||
         type == WebSocketMessageType::Close) {
         return;
     }
-    auto ctx = conn->getContext<PresenceContext>();
-    if (!ctx) return;  // unauthenticated frame; handshake should have closed it
+    if (type != WebSocketMessageType::Text) {
+        conn->shutdown(CloseCode::kInvalidMessage, "Text frames required");
+        return;
+    }
+    if (message.size() > maxInboundFrameBytes()) {
+        conn->shutdown(CloseCode::kMessageTooBig, "Frame too large");
+        return;
+    }
+
+    // The in-memory limiter runs before active-session validation, preventing
+    // a frame flood from becoming a MongoDB lookup flood.
+    if (!ctx->frameLimiter.guard("default")) return;
+
+    AccessClaims currentClaims;
+    if (pulse::filters::validateAccessToken(ctx->accessToken, currentClaims) !=
+            pulse::filters::AccessTokenStatus::Valid ||
+        currentClaims.userId != ctx->userId) {
+        conn->shutdown(CloseCode::kViolation,
+                       "Authentication expired or revoked");
+        return;
+    }
 
     Json::Value root;
     Json::CharReaderBuilder rb;
@@ -307,6 +473,8 @@ void PresenceSocket::handleConnectionClosed(const WebSocketConnectionPtr& conn) 
     auto ctx = conn->getContext<PresenceContext>();
     PresenceHub::instance().dropConnection(conn);
     if (!ctx) return;  // never authenticated
+    if (ctx->closed.exchange(true)) return;
+    if (!ctx->presenceRegistered.exchange(false)) return;
 
     // handler #10 (disconnect): Redis DECR; only emit "offline" when the LAST
     // socket for this user goes away. No DB write for the presence bookkeeping.
@@ -323,13 +491,9 @@ void PresenceSocket::handleConnectionClosed(const WebSocketConnectionPtr& conn) 
 void PresenceSocket::handleUserOnline(const WebSocketConnectionPtr& conn) {
     auto ctx = conn->getContext<PresenceContext>();
     if (!ctx) return;
-    try {
-        bool justCameOnline = pulse::presence().addConnection(ctx->userId);
-        if (!justCameOnline) return;  // another tab/device was already online
-        notifyConversationPeers(ctx->userId, true);
-    } catch (const std::exception& error) {
-        pulse::log::error("\xE2\x9D\x8C User online error: {}", error.what());
-    }
+    // Registration happens once during the authenticated connect. A client
+    // heartbeat only refreshes the TTL; incrementing here double-counts.
+    pulse::presence().touch(ctx->userId);
 }
 
 void PresenceSocket::notifyConversationPeers(const std::string& userId,

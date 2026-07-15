@@ -26,13 +26,18 @@ constexpr std::chrono::seconds kCountTtl{PresenceService::PRESENCE_TTL_SEC * 4};
 } // namespace
 
 // Register a new socket for a user. Returns true if the user JUST came online.
-bool PresenceService::addConnection(const std::string& userId) {
+bool PresenceService::addConnection(const std::string& userId,
+                                    bool& registered) {
+  registered = false;
   if (userId.empty()) return false;
   try {
     auto redis = cache().raw();
     if (!redis) return false;
     // Increment counter -> count.
     long long count = redis->incr(countKeyFor(userId));
+    // From this point the caller owns one matching decrement, even if a
+    // best-effort TTL/presence write below fails.
+    registered = true;
     // Keep the counter from leaking if a process dies mid-session.
     redis->expire(countKeyFor(userId), kCountTtl);
     // Set presence key '1' with 90s TTL.
@@ -74,6 +79,10 @@ void PresenceService::touch(const std::string& userId) {
     auto redis = cache().raw();
     if (!redis) return;
     redis->set(keyFor(userId), "1", kPresenceTtl);
+    // Keep the connection counter alive for as long as any socket heartbeat is
+    // alive; otherwise a healthy long-lived socket loses its count after 360s
+    // and the eventual disconnect cannot produce a correct 1 -> 0 transition.
+    redis->expire(countKeyFor(userId), kCountTtl);
   } catch (...) {
     /* best-effort */
   }

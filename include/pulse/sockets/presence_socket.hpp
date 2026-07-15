@@ -36,10 +36,14 @@
 #pragma once
 
 #include <drogon/WebSocketController.h>
+#include "pulse/sockets/socket_rate_limit.hpp"
 
 #include <memory>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -53,7 +57,11 @@ namespace pulse::sockets {
 // and close handlers know who is connected and which rooms they are in.
 struct PresenceContext {
     std::string userId;          // authenticated user (from the access token)
+    std::string accessToken;     // revalidated for every frame
     std::unordered_set<std::string> rooms;  // rooms this connection has joined
+    SocketLimiter frameLimiter;  // cheap pre-database general-frame limiter
+    std::atomic<bool> presenceRegistered{false};
+    std::atomic<bool> closed{false};
 };
 
 // Process-wide room registry + Redis pub/sub bridge. One instance for the whole
@@ -62,8 +70,14 @@ struct PresenceContext {
 class PresenceHub {
 public:
     static PresenceHub& instance();
+    ~PresenceHub();
+    void shutdownInfrastructure();
+    static void shutdownExistingInfrastructure();
 
     // Connection lifecycle (local membership bookkeeping).
+    bool registerConnection(const std::string& userId,
+                            const drogon::WebSocketConnectionPtr& conn,
+                            std::size_t maxPerUser);
     void addToRoom(const std::string& room,
                    const drogon::WebSocketConnectionPtr& conn);
     void removeFromRoom(const std::string& room,
@@ -89,6 +103,9 @@ public:
 private:
     PresenceHub();
     void startSubscriber();
+    void stopSubscriber();
+    void startAuthMonitor();
+    void stopAuthMonitor();
     void handlePublished(const std::string& payload);
 
     static constexpr const char* kChannel = "presence:bcast";
@@ -97,9 +114,19 @@ private:
     // room -> set of local connections
     std::unordered_map<std::string,
                        std::unordered_set<drogon::WebSocketConnectionPtr>> rooms_;
+    // The reverse map makes close accounting idempotent.
+    std::unordered_map<std::string, std::size_t> userConnCount_;
+    std::unordered_map<drogon::WebSocketConnectionPtr, std::string> connUsers_;
 
     std::shared_ptr<sw::redis::Redis> pub_;  // publisher client (createClient())
     std::shared_ptr<sw::redis::Redis> sub_;  // subscriber client (createClient())
+    std::thread subThread_;
+    std::atomic<bool> subRunning_{false};
+    std::thread authThread_;
+    std::atomic<bool> authRunning_{false};
+    std::mutex authWaitMu_;
+    std::condition_variable authWaitCv_;
+    static std::atomic<PresenceHub*> activeHub_;
 };
 
 // The Drogon WebSocketController. Mounted at /ws/presence only.
