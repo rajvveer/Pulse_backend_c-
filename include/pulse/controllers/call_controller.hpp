@@ -17,11 +17,13 @@
 //   POST /api/v1/calls/token
 //     Mint a LiveKit join token for an already-known room. The CALLEE calls this
 //     when it accepts (it received room+callId via the push/ws invite). Also used
-//     by the caller to refresh a token. Returns { token, wsUrl, identity, room }.
+//     by the caller to refresh a token. The exact room must match unexpired
+//     server-side call state and the requester must still belong to the backing
+//     conversation. Returns { token, wsUrl, identity, room, callId }.
 //
-//   POST /api/v1/calls/end   (optional bookkeeping)
-//     Best-effort signal that a call ended; currently just clears any Redis call
-//     state. Media teardown happens client-side on LiveKit disconnect.
+//   POST /api/v1/calls/end
+//     Clears Redis call state only when the requester is the caller or callee.
+//     Media teardown happens client-side on LiveKit disconnect.
 //
 // All routes require AuthFilter. Identity in LiveKit is "<userId>#<deviceId>" so
 // the same user on two devices gets two distinct participants.
