@@ -67,13 +67,17 @@
 #include <mongocxx/exception/exception.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace pulse::controllers {
@@ -93,6 +97,87 @@ long long nowMillis() {
 }
 bsoncxx::types::b_date dateFromMillis(long long ms) {
   return bsoncxx::types::b_date{std::chrono::milliseconds{ms}};
+}
+
+std::optional<long long> dateMillis(const Json::Value& value) {
+  if (value.isNumeric()) return value.asInt64();
+  if (!value.isString() || value.asString().empty()) return std::nullopt;
+
+  const std::string text = value.asString();
+  int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+  const int matched = std::sscanf(text.c_str(), "%d-%d-%dT%d:%d:%d",
+                                  &year, &month, &day,
+                                  &hour, &minute, &second);
+  if (matched < 3) return std::nullopt;
+
+  std::tm tm{};
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = hour;
+  tm.tm_min = minute;
+  tm.tm_sec = second;
+#if defined(_WIN32)
+  std::time_t time = _mkgmtime(&tm);
+#else
+  std::time_t time = timegm(&tm);
+#endif
+  if (time == static_cast<std::time_t>(-1)) return std::nullopt;
+
+  long long millis = static_cast<long long>(time) * 1000;
+  const auto dot = text.find('.');
+  if (dot != std::string::npos) {
+    std::string fraction;
+    for (size_t i = dot + 1; i < text.size() &&
+                             std::isdigit(static_cast<unsigned char>(text[i])); ++i)
+      fraction.push_back(text[i]);
+    while (fraction.size() < 3) fraction.push_back('0');
+    if (!fraction.empty()) millis += std::stoll(fraction.substr(0, 3));
+  }
+  return millis;
+}
+
+void appendDate(bld::document& out, const char* key, const Json::Value& value,
+                 std::optional<long long> fallback = std::nullopt) {
+  auto millis = dateMillis(value);
+  if (!millis) millis = fallback;
+  const std::string ownedKey(key);
+  if (millis) out.append(kvp(ownedKey, dateFromMillis(*millis)));
+  else out.append(kvp(ownedKey, bsoncxx::types::b_null{}));
+}
+
+bsoncxx::document::value objectWithDate(Json::Value object,
+                                        const char* dateField,
+                                        std::optional<long long> fallback) {
+  Json::Value date = object.isObject() && object.isMember(dateField)
+                         ? object[dateField]
+                         : Json::Value(Json::nullValue);
+  std::optional<bsoncxx::oid> id;
+  if (object.isObject() && object.isMember("_id") && object["_id"].isString())
+    id = bj::tryOid(object["_id"].asString());
+  object.removeMember(dateField);
+  object.removeMember("_id");
+
+  auto base = bj::fromJson(object);
+  bld::document out;
+  if (id) out.append(kvp("_id", *id));
+  for (const auto& element : base.view())
+    out.append(kvp(element.key(), element.get_value()));
+  appendDate(out, dateField, date, fallback);
+  return out.extract();
+}
+
+bsoncxx::array::value arrayWithDate(const Json::Value& array,
+                                    const char* dateField,
+                                    long long fallback) {
+  bld::array out;
+  if (array.isArray()) {
+    for (const auto& value : array) {
+      if (value.isObject())
+        out.append(objectWithDate(value, dateField, fallback));
+    }
+  }
+  return out.extract();
 }
 
 // ── { success:false, message } response (the JS error shape on this router) ──
@@ -190,7 +275,9 @@ void populateAuthors(Json::Value& docs) {
       if (auto o = bj::tryOid(hex)) in.append(*o);
     auto filter = make_document(kvp("_id", make_document(kvp("$in", in.extract()))));
     auto projection = make_document(kvp("username", 1), kvp("name", 1),
-                                    kvp("avatar", 1), kvp("profile", 1),
+                                    kvp("avatar", 1),
+                                    kvp("profile.displayName", 1),
+                                    kvp("profile.avatar", 1),
                                     kvp("isVerified", 1));
     mongocxx::options::find opts{};
     opts.projection(projection.view());
@@ -241,47 +328,121 @@ std::optional<Json::Value> findPostById(const std::string& postId) {
   }
 }
 
-// Persist a PulseScore document mutated by recordAction (the JS `ps.save()`),
-// best-effort. recordAction has no model-level persist, so we replace_one the
-// document, re-splicing reference / date fields as their proper BSON types so
-// the `user` ObjectId and timestamps are never downgraded to strings.
-void persistPulseScore(const Json::Value& psIn) {
+// A post is visible to its author, to everyone when public, and to an actual
+// follower when its visibility is "followers". Unknown values fail closed.
+bool canViewPost(const Json::Value& post, const std::string& viewerId) {
+  if (!post.isObject() || !post.get("isActive", true).asBool()) return false;
+
+  const std::string ownerId = authorHex(post);
+  if (!viewerId.empty() && ownerId == viewerId) return true;
+
+  const std::string visibility = post.get("visibility", "public").asString();
+  if (visibility == "public") return true;
+  if (visibility != "followers" || viewerId.empty() || ownerId.empty()) {
+    return false;
+  }
+  return pulse::models::follow::isFollowing(viewerId, ownerId);
+}
+
+// Apply and persist PulseScore signals with optimistic concurrency. Replacing
+// a document read before another request used to overwrite the other request's
+// metrics, achievements, and history. Each retry re-reads the current document,
+// replays the requested actions, and compares/increments its version key.
+// This stays best-effort because social-score side effects must not fail the
+// primary post/like request.
+bool recordPulseScoreActions(
+    const std::string& userId,
+    const std::vector<std::pair<std::string, double>>& actions) {
+  if (actions.empty()) return true;
+
   try {
-    if (!psIn.isObject() || !psIn.isMember("_id") || !psIn["_id"].isString())
-      return;
-    auto idOid = bj::tryOid(psIn["_id"].asString());
-    if (!idOid) return;
-
-    Json::Value ps = pulse::models::pulsescore::sanitizeForOutput(psIn);
-
-    // Pull out fields that must keep real BSON types.
-    std::optional<bsoncxx::oid> userOid;
-    if (ps.isMember("user") && ps["user"].isString())
-      userOid = bj::tryOid(ps["user"].asString());
-
-    long long nowMs = nowMillis();
-    ps.removeMember("_id");
-    ps.removeMember("user");
-    // Dates: re-stamp as BSON dates after the JSON conversion.
-    ps.removeMember("createdAt");
-    ps.removeMember("updatedAt");
-    ps.removeMember("lastComputedAt");
-
-    auto baseDoc = bj::fromJson(ps);
-
-    bld::document repl;
-    repl.append(kvp("_id", *idOid));
-    if (userOid) repl.append(kvp("user", *userOid));
-    for (const auto& el : baseDoc.view()) repl.append(kvp(el.key(), el.get_value()));
-    repl.append(kvp("lastComputedAt", dateFromMillis(nowMs)));
-    if (psIn.isMember("createdAt"))
-      repl.append(kvp("createdAt",
-          dateFromMillis(nowMs)));  // preserve existence; value re-stamped
-    repl.append(kvp("updatedAt", dateFromMillis(nowMs)));
-
+    auto userOid = bj::tryOid(userId);
+    if (!userOid) return false;
+    // Ensure the unique per-user document exists, then use raw reads below so
+    // the internal version key (removed from API output) participates in CAS.
+    (void)pulse::models::pulsescore::getOrCreate(userId);
     auto col = pulse::db::collection(pulse::models::pulsescore::kCollection);
-    col.replace_one(make_document(kvp("_id", *idOid)), repl.view());
-  } catch (...) { /* best-effort: signal persistence never blocks the response */ }
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      auto raw = col.find_one(make_document(kvp("user", *userOid)));
+      if (!raw) return false;
+      Json::Value original = bj::toJson(raw->view());
+      if (!original.isObject() || !original.isMember("_id") ||
+          !original["_id"].isString())
+        return false;
+
+      auto idOid = bj::tryOid(original["_id"].asString());
+      if (!idOid) return false;
+      std::optional<long long> originalVersion;
+      if (original.isMember("__v") && original["__v"].isNumeric())
+        originalVersion = original["__v"].asInt64();
+
+      Json::Value ps = original;
+      for (const auto& [action, value] : actions)
+        ps = pulse::models::pulsescore::recordAction(
+            std::move(ps), action, value);
+
+      // Pull out fields that must keep real BSON types.
+      std::optional<bsoncxx::oid> userOid;
+      if (ps.isMember("user") && ps["user"].isString())
+        userOid = bj::tryOid(ps["user"].asString());
+
+      const long long nowMs = nowMillis();
+      Json::Value metrics = ps["metrics"];
+      Json::Value history = ps["history"];
+      Json::Value scoreHistory = ps["scoreHistory"];
+      Json::Value achievements = ps["achievements"];
+      Json::Value createdAt = ps["createdAt"];
+      Json::Value lastComputedAt = ps["lastComputedAt"];
+      ps.removeMember("_id");
+      ps.removeMember("user");
+      ps.removeMember("metrics");
+      ps.removeMember("history");
+      ps.removeMember("scoreHistory");
+      ps.removeMember("achievements");
+      ps.removeMember("createdAt");
+      ps.removeMember("updatedAt");
+      ps.removeMember("lastComputedAt");
+      ps.removeMember("__v");
+
+      auto baseDoc = bj::fromJson(ps);
+
+      bld::document repl;
+      repl.append(kvp("_id", *idOid));
+      if (userOid) repl.append(kvp("user", *userOid));
+      for (const auto& el : baseDoc.view())
+        repl.append(kvp(el.key(), el.get_value()));
+      repl.append(kvp("__v", originalVersion.value_or(0) + 1));
+      if (metrics.isObject())
+        repl.append(kvp("metrics",
+                        objectWithDate(metrics, "lastActiveDate", std::nullopt)));
+      repl.append(kvp("history", arrayWithDate(history, "date", nowMs)));
+      if (scoreHistory.isArray())
+        repl.append(kvp("scoreHistory",
+                        arrayWithDate(scoreHistory, "date", nowMs)));
+      repl.append(kvp("achievements",
+                      arrayWithDate(achievements, "unlockedAt", nowMs)));
+      appendDate(repl, "lastComputedAt", lastComputedAt, nowMs);
+      appendDate(repl, "createdAt", createdAt, nowMs);
+      repl.append(kvp("updatedAt", dateFromMillis(nowMs)));
+
+      bld::document filter;
+      filter.append(kvp("_id", *idOid));
+      if (originalVersion) {
+        filter.append(kvp("__v", *originalVersion));
+      } else {
+        filter.append(kvp("__v",
+                          make_document(kvp("$exists", false))));
+      }
+
+      auto result = col.replace_one(filter.view(), repl.view());
+      if (result && result->matched_count() == 1) return true;
+    }
+    pulse::log::warn("[PulseScore] concurrent update retry limit reached");
+  } catch (const std::exception& e) {
+    pulse::log::warn("[PulseScore] signal persistence failed: {}", e.what());
+  }
+  return false;
 }
 
 } // namespace
@@ -333,11 +494,16 @@ void PostController::createPost(const HttpRequestPtr& req,
     auto authorOid = bj::tryOid(userId);
     Json::Value forBson = toInsert;
     forBson.removeMember("author");
+    // Schema timestamps must be persisted as BSON Dates, not ISO strings.
+    forBson.removeMember("createdAt");
+    forBson.removeMember("updatedAt");
     auto baseDoc = bj::fromJson(forBson);
 
     bld::document insert;
     if (authorOid) insert.append(kvp("author", *authorOid));
     for (const auto& el : baseDoc.view()) insert.append(kvp(el.key(), el.get_value()));
+    const auto insertedAt = dateFromMillis(nowMillis());
+    insert.append(kvp("createdAt", insertedAt), kvp("updatedAt", insertedAt));
 
     std::string newId;
     {
@@ -361,8 +527,6 @@ void PostController::createPost(const HttpRequestPtr& req,
 
     // 📊 Record Pulse Score signal (non-blocking).
     try {
-      Json::Value ps = pulse::models::pulsescore::getOrCreate(userId);
-      ps = pulse::models::pulsescore::recordAction(ps, "post");
       // JS: if (post.image || post.media?.length > 0) — note these are the
       // TOP-LEVEL post.image / post.media (NOT content.media); the Post schema
       // stores media under content.media, so this matches the JS exactly,
@@ -371,9 +535,9 @@ void PostController::createPost(const HttpRequestPtr& req,
                       !(toInsert["image"].isString() && toInsert["image"].asString().empty());
       bool hasTopMedia = toInsert.isMember("media") && toInsert["media"].isArray() &&
                          !toInsert["media"].empty();
-      if (hasImage || hasTopMedia)
-        ps = pulse::models::pulsescore::recordAction(ps, "media_post");
-      persistPulseScore(ps);
+      std::vector<std::pair<std::string, double>> actions{{"post", 1.0}};
+      if (hasImage || hasTopMedia) actions.emplace_back("media_post", 1.0);
+      recordPulseScoreActions(userId, actions);
     } catch (...) { /* best-effort */ }
 
     // Re-fetch + populate author for the response shape.
@@ -418,18 +582,8 @@ void PostController::getPost(const HttpRequestPtr& req,
     populateAuthorSingle(postForResp);
 
     // Enforce visibility — 404 (not 403) to avoid confirming existence.
-    const std::string aId = authorHex(postForResp);
-    const bool isOwner = (aId == userId);
-    if (!isOwner) {
-      const std::string vis = postForResp.get("visibility", "public").asString();
-      if (vis == "private")
-        return cb(fail(drogon::k404NotFound, "Post not found"));
-      if (vis == "followers") {
-        bool follows = pulse::models::follow::isFollowing(userId, aId);
-        if (!follows)
-          return cb(fail(drogon::k404NotFound, "Post not found"));
-      }
-    }
+    if (!canViewPost(post, userId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
 
     // Increment view count atomically: Post.updateOne({_id},{$inc:{'stats.views':1}})
     if (auto o = bj::tryOid(postId)) {
@@ -500,20 +654,33 @@ void PostController::getUserPosts(const HttpRequestPtr& req,
       auto proj = make_document(kvp("_id", 1));
       mongocxx::options::find opts{};
       opts.projection(proj.view());
-      auto doc = col.find_one(make_document(kvp("username", username)), opts);
+      auto doc = col.find_one(
+          make_document(kvp("username", username), kvp("isActive", true)), opts);
       if (!doc) return cb(fail(drogon::k404NotFound, "User not found"));
       Json::Value u = bj::toJson(doc->view());
       targetUserId = u["_id"].asString();
     }
+    auto targetOid = bj::tryOid(targetUserId);
+    if (!targetOid) return cb(fail(drogon::k404NotFound, "User not found"));
 
     const bool isOwnProfile =
         !currentUserId.empty() && targetUserId == currentUserId;
+    const bool followsTarget = !isOwnProfile &&
+        pulse::models::follow::isFollowing(currentUserId, targetUserId);
 
     // Build query: { author: user._id, isActive: true [, isAnonymous: false] }
     bld::document filter;
-    if (auto o = bj::tryOid(targetUserId)) filter.append(kvp("author", *o));
+    filter.append(kvp("author", *targetOid));
     filter.append(kvp("isActive", true));
-    if (!isOwnProfile) filter.append(kvp("isAnonymous", false));
+    if (!isOwnProfile) {
+      filter.append(kvp("isAnonymous", false));
+      if (followsTarget) {
+        filter.append(kvp("visibility",
+                          make_document(kvp("$in", make_array("public", "followers")))));
+      } else {
+        filter.append(kvp("visibility", "public"));
+      }
+    }
 
     mongocxx::options::find opts{};
     opts.sort(make_document(kvp("isPinned", -1), kvp("createdAt", -1)));
@@ -599,7 +766,8 @@ void PostController::toggleLike(const HttpRequestPtr& req,
     const std::string userId = user["userId"].asString();
 
     auto found = findPostById(postId);
-    if (!found) return cb(fail(drogon::k404NotFound, "Post not found"));
+    if (!found || !canViewPost(*found, userId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
     Json::Value post = *found;
 
     // const { liked, likeCount } = await Like.toggleLike(userId, 'post', postId);
@@ -633,14 +801,10 @@ void PostController::toggleLike(const HttpRequestPtr& req,
       } catch (...) {}
       // PulseScore signals (non-blocking): like_given (user), like_received (author)
       try {
-        Json::Value ps = pulse::models::pulsescore::getOrCreate(userId);
-        ps = pulse::models::pulsescore::recordAction(ps, "like_given");
-        persistPulseScore(ps);
+        recordPulseScoreActions(userId, {{"like_given", 1.0}});
       } catch (...) {}
       try {
-        Json::Value ps = pulse::models::pulsescore::getOrCreate(aId);
-        ps = pulse::models::pulsescore::recordAction(ps, "like_received");
-        persistPulseScore(ps);
+        recordPulseScoreActions(aId, {{"like_received", 1.0}});
       } catch (...) {}
 
       // Notification.createNotification (non-blocking)
@@ -681,7 +845,8 @@ void PostController::addComment(const HttpRequestPtr& req,
     const Json::Value& b = bodyOrEmpty(req->getJsonObject(), empty);
 
     auto found = findPostById(postId);
-    if (!found) return cb(fail(drogon::k404NotFound, "Post not found"));
+    if (!found || !canViewPost(*found, userId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
     Json::Value post = *found;
 
     // if (!post.allowComments) -> 403 'Comments disabled'
@@ -705,6 +870,20 @@ void PostController::addComment(const HttpRequestPtr& req,
                      b["parentCommentId"].isString() &&
                      !b["parentCommentId"].asString().empty();
     std::string parentCommentId = hasParent ? b["parentCommentId"].asString() : "";
+
+    // Replies must target an active comment belonging to this post; otherwise
+    // a caller could splice comment trees across unrelated posts.
+    if (hasParent) {
+      auto parentOid = bj::tryOid(parentCommentId);
+      auto postOid = bj::tryOid(postId);
+      if (!parentOid || !postOid)
+        return cb(fail(drogon::k400BadRequest, "Invalid parent comment"));
+      auto comments = pulse::db::collection(pulse::models::comment::kCollection);
+      auto parent = comments.find_one(make_document(
+          kvp("_id", *parentOid), kvp("post", *postOid), kvp("isActive", true)));
+      if (!parent)
+        return cb(fail(drogon::k404NotFound, "Parent comment not found"));
+    }
 
     // new Comment({ post, author, content: content?.trim()||'', gif: gif||null,
     //               parentComment: parentCommentId||null })
@@ -731,6 +910,8 @@ void PostController::addComment(const HttpRequestPtr& req,
       forBson.removeMember("post");
       forBson.removeMember("author");
       forBson.removeMember("parentComment");
+      forBson.removeMember("createdAt");
+      forBson.removeMember("updatedAt");
       auto baseDoc = bj::fromJson(forBson);
 
       bld::document insert;
@@ -740,6 +921,8 @@ void PostController::addComment(const HttpRequestPtr& req,
       if (parentOid) insert.append(kvp("parentComment", *parentOid));
       else           insert.append(kvp("parentComment", bsoncxx::types::b_null{}));
       for (const auto& el : baseDoc.view()) insert.append(kvp(el.key(), el.get_value()));
+      const auto insertedAt = dateFromMillis(nowMillis());
+      insert.append(kvp("createdAt", insertedAt), kvp("updatedAt", insertedAt));
 
       auto col = pulse::db::collection(pulse::models::comment::kCollection);
       auto res = col.insert_one(insert.view());
@@ -848,7 +1031,8 @@ void addLikeInfo(Json::Value& list,
 // Hydrate a `replies` array of ObjectId refs into full reply documents, with
 // each reply's author populated. Mirrors .populate({path:'replies',populate:author})
 // and the recursive nested-reply population in the JS.
-void populateReplies(Json::Value& comment, int depth) {
+void populateReplies(Json::Value& comment, const bsoncxx::oid& postOid,
+                     int depth) {
   if (depth > 8) return;  // safety bound on pathological nesting
   if (!comment.isObject() || !comment.isMember("replies")) return;
   Json::Value& replies = comment["replies"];
@@ -867,7 +1051,9 @@ void populateReplies(Json::Value& comment, int depth) {
   try {
     bld::array in;
     for (const auto& hex : ids) if (auto o = bj::tryOid(hex)) in.append(*o);
-    auto filter = make_document(kvp("_id", make_document(kvp("$in", in.extract()))));
+    auto filter = make_document(
+        kvp("_id", make_document(kvp("$in", in.extract()))),
+        kvp("post", postOid), kvp("isActive", true));
     auto col = pulse::db::collection(pulse::models::comment::kCollection);
     auto cursor = col.find(filter.view());
     for (const auto& d : cursor) {
@@ -887,7 +1073,7 @@ void populateReplies(Json::Value& comment, int depth) {
 
   // Populate each reply's author, then recurse into nested replies.
   populateAuthors(comment["replies"]);
-  for (auto& r : comment["replies"]) populateReplies(r, depth + 1);
+  for (auto& r : comment["replies"]) populateReplies(r, postOid, depth + 1);
 }
 
 } // namespace
@@ -900,6 +1086,12 @@ void PostController::getComments(const HttpRequestPtr& req,
     const std::string userId =
         user.isMember("userId") ? user["userId"].asString() : "";
 
+    if (!bj::isValidOid(postId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
+    auto post = findPostById(postId);
+    if (!post || !canViewPost(*post, userId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
+
     std::string sort = req->getParameter("sort");
     if (sort.empty()) sort = "recent";
     int page  = clampedInt(req->getParameter("page"), 1, 1, 100);
@@ -911,7 +1103,9 @@ void PostController::getComments(const HttpRequestPtr& req,
     Json::Value comments(Json::arrayValue);
     {
       bld::document filter;
-      if (auto o = bj::tryOid(postId)) filter.append(kvp("post", *o));
+      // postId was validated above. Never omit the post predicate and turn a
+      // malformed route parameter into a global comment listing.
+      filter.append(kvp("post", bj::oid(postId)));
       filter.append(kvp("parentComment", bsoncxx::types::b_null{}));
       filter.append(kvp("isActive", true));
 
@@ -928,7 +1122,8 @@ void PostController::getComments(const HttpRequestPtr& req,
 
     // Populate top-level authors, then replies (recursively) with their authors.
     populateAuthors(comments);
-    for (auto& c : comments) populateReplies(c, 0);
+    const auto postOid = bj::oid(postId);
+    for (auto& c : comments) populateReplies(c, postOid, 0);
 
     // Collect ids and resolve like counts/status from the atomic Like collection.
     std::vector<std::string> ids;
@@ -981,15 +1176,21 @@ void PostController::toggleCommentLike(const HttpRequestPtr& req,
     Json::Value user = req->getAttributes()->get<Json::Value>("user");
     const std::string userId = user["userId"].asString();
 
-    // const comment = await Comment.findById(commentId).select('_id').lean();
+    auto post = findPostById(postId);
+    if (!post || !canViewPost(*post, userId))
+      return cb(fail(drogon::k404NotFound, "Post not found"));
+
+    // Require an active comment that belongs to the post named in the route.
     bool exists = false;
-    if (auto o = bj::tryOid(commentId)) {
+    if (auto o = bj::tryOid(commentId); o && bj::isValidOid(postId)) {
       try {
         auto col = pulse::db::collection(pulse::models::comment::kCollection);
         auto proj = make_document(kvp("_id", 1));
         mongocxx::options::find opts{};
         opts.projection(proj.view());
-        auto d = col.find_one(make_document(kvp("_id", *o)), opts);
+        auto d = col.find_one(make_document(
+            kvp("_id", *o), kvp("post", bj::oid(postId)),
+            kvp("isActive", true)), opts);
         exists = static_cast<bool>(d);
       } catch (const std::exception& e) {
         pulse::log::warn("[posts] comment lookup failed: {}", e.what());
@@ -1029,14 +1230,19 @@ void PostController::deletePost(const HttpRequestPtr& req,
     if (aId != userId)
       return cb(fail(drogon::k403Forbidden, "You can only delete your own posts"));
 
-    // post.isActive = false; await post.save();
+    // Atomically transition active -> deleted. A repeated DELETE must not
+    // decrement the cached author post count again.
+    bool deletedNow = false;
     if (auto o = bj::tryOid(postId)) {
       auto col = pulse::db::collection(pulse::models::post::kCollection);
-      col.update_one(make_document(kvp("_id", *o)),
-                     make_document(kvp("$set",
-                         make_document(kvp("isActive", false),
-                                       kvp("updatedAt", dateFromMillis(nowMillis()))))));
+      auto result = col.update_one(
+          make_document(kvp("_id", *o), kvp("isActive", true)),
+          make_document(kvp("$set",
+              make_document(kvp("isActive", false),
+                            kvp("updatedAt", dateFromMillis(nowMillis()))))));
+      deletedNow = result && result->modified_count() == 1;
     }
+    if (!deletedNow) return cb(fail(drogon::k404NotFound, "Post not found"));
 
     // await User.findByIdAndUpdate(userId, { $inc: { 'stats.posts': -1 } })
     if (auto o = bj::tryOid(userId)) {

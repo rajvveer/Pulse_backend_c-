@@ -15,6 +15,7 @@
 // pulse::http::json / pulse::http::ok directly.
 #include "pulse/controllers/pulse_score_controller.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <optional>
@@ -40,29 +41,29 @@ namespace {
 // Mirrors `parseInt(str, 10)`: trims leading whitespace, reads an optional sign
 // then digits, stops at the first non-digit, returns nullopt (NaN) when no digit
 // was consumed.
-std::optional<long> jsParseInt(const std::string& s) {
+std::optional<long long> jsParseInt(const std::string& s) {
   size_t i = 0;
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
-  bool neg = false;
+  const size_t numberStart = i;
   if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-    neg = (s[i] == '-');
     ++i;
   }
-  size_t start = i;
-  long value = 0;
-  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
-    value = value * 10 + (s[i] - '0');
-    ++i;
+  const size_t digitsStart = i;
+  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+  if (i == digitsStart) return std::nullopt;
+  try {
+    return std::stoll(s.substr(numberStart, i - numberStart));
+  } catch (...) {
+    return std::nullopt;
   }
-  if (i == start) return std::nullopt;  // no digits -> NaN
-  return neg ? -value : value;
 }
 
 // `parseInt(req.query.x) || fallback` — NaN OR 0 (both falsy) -> fallback.
-long parseIntOr(const std::string& raw, long fallback) {
-  auto parsed = jsParseInt(raw);  // absent param is "" -> NaN -> fallback
-  if (!parsed || *parsed == 0) return fallback;
-  return *parsed;
+long long clampedParam(const std::string& raw, long long fallback,
+                       long long lo, long long hi) {
+  auto parsed = jsParseInt(raw);
+  long long value = (!parsed || *parsed == 0) ? fallback : *parsed;
+  return std::max(lo, std::min(hi, value));
 }
 
 // req.user.userId from the AuthFilter-populated attribute.
@@ -160,7 +161,7 @@ void PulseScoreController::getHistory(
     const drogon::HttpRequestPtr& req,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
   try {
-    const long days = parseIntOr(req->getParameter("days"), 30);
+    const long long days = clampedParam(req->getParameter("days"), 30, 1, 365);
     const std::string userId = authedUserId(req);
     Json::Value ps = model::getOrCreate(userId);
     callback(pulse::http::ok(sliceTail(ps["history"], days)));  // { success:true, data }
@@ -182,7 +183,7 @@ void PulseScoreController::getLeaderboard(
     const drogon::HttpRequestPtr& req,
     std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
   try {
-    const long limit = parseIntOr(req->getParameter("limit"), 50);
+    const long long limit = clampedParam(req->getParameter("limit"), 50, 1, 100);
     const std::string userId = authedUserId(req);
 
     Json::Value leaderboard = model::getLeaderboard(limit);

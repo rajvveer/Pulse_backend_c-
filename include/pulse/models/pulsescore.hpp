@@ -16,7 +16,7 @@
 //                    totalFollowing, totalShares, totalViews, uniqueVibes,
 //                    mediaPostsCount, daysActive, currentStreak, longestStreak }
 //                          each Number default 0,
-//                    lastActiveDate String default ''
+//                    lastActiveDate Date/null (legacy strings normalize on read)
 //   history        [{ date Date default now, score Number, tier String,
 //                     delta Number }]
 //   achievements   [{ id String, name String, description String, emoji String,

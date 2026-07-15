@@ -283,7 +283,7 @@ Json::Value getOrCreate(const std::string& userId) {
         kvp("daysActive",            static_cast<int64_t>(jsRound(m["daysActive"].asDouble()))),
         kvp("currentStreak",         static_cast<int64_t>(jsRound(m["currentStreak"].asDouble()))),
         kvp("longestStreak",         static_cast<int64_t>(jsRound(m["longestStreak"].asDouble()))),
-        kvp("lastActiveDate",        m["lastActiveDate"].asString()))));
+        kvp("lastActiveDate",        bsoncxx::types::b_null{}))));
   }
 
   insert.append(kvp("history", bld::array{}));
@@ -291,14 +291,24 @@ Json::Value getOrCreate(const std::string& userId) {
   insert.append(kvp("lastComputedAt", now));
   insert.append(kvp("createdAt", now));
   insert.append(kvp("updatedAt", now));
+  insert.append(kvp("__v", static_cast<std::int64_t>(0)));
 
-  auto result = col.insert_one(insert.extract());
+  try {
+    col.insert_one(insert.extract());
+  } catch (const std::exception&) {
+    // The unique user index makes concurrent get-or-create calls race safely:
+    // if another request inserted first, return its document. Propagate a real
+    // database failure when no winner exists.
+    auto raced = col.find_one(make_document(kvp("user", userOid)));
+    if (raced)
+      return sanitizeForOutput(pulse::bsonjson::toJson(raced->view()));
+    throw;
+  }
 
   // Re-read so the returned JSON mirrors the persisted document (incl. _id).
-  if (result) {
-    auto created = col.find_one(make_document(kvp("user", userOid)));
-    if (created) return sanitizeForOutput(pulse::bsonjson::toJson(created->view()));
-  }
+  auto created = col.find_one(make_document(kvp("user", userOid)));
+  if (created)
+    return sanitizeForOutput(pulse::bsonjson::toJson(created->view()));
   return sanitizeForOutput(doc);
 }
 
@@ -400,13 +410,18 @@ Json::Value recordAction(Json::Value doc, const std::string& action,
   else if (action == "view_received") add("totalViews");
   else if (action == "media_post")  add("mediaPostsCount");
 
+  // BSON dates cross the JSON bridge as ISO-8601. Normalize that and the
+  // legacy YYYY-MM-DD representation to the same day key.
+  std::string lastActiveDate = m["lastActiveDate"].asString();
+  if (lastActiveDate.size() >= 10) lastActiveDate.resize(10);
+
   // Update streak.
-  if (m["lastActiveDate"].asString() != today) {
+  if (lastActiveDate != today) {
     const std::string yStr = yesterdayStr();
 
-    if (m["lastActiveDate"].asString() == yStr) {
+    if (lastActiveDate == yStr) {
       m["currentStreak"] = num(m, "currentStreak") + 1;
-    } else if (m["lastActiveDate"].asString() != today) {
+    } else if (lastActiveDate != today) {
       m["currentStreak"] = 1;
     }
 
