@@ -14,18 +14,30 @@
 #include "pulse/controllers/media_controller.hpp"
 
 #include "pulse/http_response.hpp"
+#include "pulse/config.hpp"
 #include "pulse/logger.hpp"
 #include "pulse/services/media_service.hpp"
 
 #include <drogon/MultiPart.h>
 
 #include <exception>
+#include <algorithm>
 #include <string>
 #include <vector>
 
 using namespace pulse::controllers;
 
 namespace {
+
+size_t maxUploadBytes() {
+  const int64_t mb = std::max<int64_t>(1, pulse::config().envInt("UPLOAD_MAX_MB", 25));
+  return static_cast<size_t>(mb) * 1024U * 1024U;
+}
+
+size_t maxUploadFiles() {
+  return static_cast<size_t>(std::max<int64_t>(
+      1, std::min<int64_t>(20, pulse::config().envInt("UPLOAD_MAX_FILES", 5))));
+}
 
 // Shape one UploadResult into the JSON object the JS controller emits for each
 // file: { url, publicId, width, height, format, type }. Note `type` maps to the
@@ -77,8 +89,19 @@ void MediaController::uploadMedia(const HttpRequestPtr& req,
       return;
     }
 
+    if (parser.getFiles().size() != 1) {
+      callback(messageError(drogon::k400BadRequest,
+                            "Exactly one file must be uploaded"));
+      return;
+    }
+
     const auto& file = parser.getFiles()[0];
     const auto content = file.fileContent();           // raw bytes (string_view)
+    if (content.size() > maxUploadBytes()) {
+      callback(messageError(drogon::k413RequestEntityTooLarge,
+                            "Uploaded file is too large"));
+      return;
+    }
     const std::string bytes(content.data(), content.size());
     const std::string filename = file.getFileName();
 
@@ -112,6 +135,12 @@ void MediaController::uploadMultipleMedia(const HttpRequestPtr& req,
       return;
     }
 
+    if (parser.getFiles().size() > maxUploadFiles()) {
+      callback(messageError(drogon::k400BadRequest,
+                            "Too many files uploaded"));
+      return;
+    }
+
     // req.files.map(file => upload) then Promise.all. Any rejection bubbles to
     // the catch -> 500 { message:'Upload failed', error }. We upload each file
     // sequentially; the first failure throws and is caught below, matching the
@@ -119,6 +148,11 @@ void MediaController::uploadMultipleMedia(const HttpRequestPtr& req,
     Json::Value results(Json::arrayValue);
     for (const auto& file : parser.getFiles()) {
       const auto content = file.fileContent();
+      if (content.size() > maxUploadBytes()) {
+        callback(messageError(drogon::k413RequestEntityTooLarge,
+                              "An uploaded file is too large"));
+        return;
+      }
       const std::string bytes(content.data(), content.size());
       const std::string filename = file.getFileName();
       pulse::UploadResult r = pulse::media().uploadPostMedia(bytes, filename);

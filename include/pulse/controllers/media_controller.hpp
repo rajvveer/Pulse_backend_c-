@@ -32,12 +32,14 @@ public:
   ADD_METHOD_TO(MediaController::uploadMedia,
                 "/api/v1/media/upload", Post,
                 "pulse::filters::AuthFilter",
-                "pulse::filters::UploadLimiter");
+                "pulse::filters::UploadLimiter",
+                "pulse::filters::UploadGuard");
   // POST /api/v1/media/upload-multiple
   ADD_METHOD_TO(MediaController::uploadMultipleMedia,
                 "/api/v1/media/upload-multiple", Post,
                 "pulse::filters::AuthFilter",
-                "pulse::filters::UploadLimiter");
+                "pulse::filters::UploadLimiter",
+                "pulse::filters::UploadGuard");
   METHOD_LIST_END
 
   // POST /upload — single image. mediaController.uploadMedia.

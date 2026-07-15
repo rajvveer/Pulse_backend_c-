@@ -13,6 +13,7 @@
 // with fields: file, api_key, timestamp, signature, folder, transformation,
 // eager, eager_async. The signature is sha1(sortedParams + api_secret).
 #include "pulse/services/media_service.hpp"
+#include "pulse/services/http_client.hpp"
 #include "pulse/config.hpp"
 #include "pulse/logger.hpp"
 
@@ -21,6 +22,7 @@
 #include <drogon/HttpResponse.h>
 #include <drogon/HttpTypes.h>
 
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 
 #include <algorithm>
@@ -48,6 +50,45 @@ std::string sha1Hex(const std::string& input) {
     out += hex[b & 0x0F];
   }
   return out;
+}
+
+// A fresh high-entropy boundary prevents an uploaded file from deliberately
+// colliding with the multipart delimiter. RNG failure must abort the request.
+std::string randomMultipartBoundary() {
+  unsigned char random[16];
+  if (RAND_bytes(random, static_cast<int>(sizeof(random))) != 1) {
+    throw std::runtime_error("Failed to generate multipart boundary");
+  }
+
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string boundary = "----PulseCloudinary";
+  boundary.reserve(boundary.size() + sizeof(random) * 2);
+  for (const unsigned char byte : random) {
+    boundary.push_back(kHex[(byte >> 4) & 0x0f]);
+    boundary.push_back(kHex[byte & 0x0f]);
+  }
+  return boundary;
+}
+
+// The original filename is emitted inside a quoted Content-Disposition
+// parameter. Keep only its basename and neutralize characters that can escape
+// the quoted value or inject another multipart header.
+std::string sanitizeMultipartFilename(const std::string& filename) {
+  const auto separator = filename.find_last_of("/\\");
+  const std::string basename =
+      separator == std::string::npos ? filename : filename.substr(separator + 1);
+
+  std::string safe;
+  safe.reserve(std::min<std::size_t>(basename.size(), 255));
+  for (const unsigned char ch : basename) {
+    if (safe.size() == 255) break;
+    if (ch < 0x20 || ch == 0x7f || ch == '"' || ch == '\\') {
+      safe.push_back('_');
+    } else {
+      safe.push_back(static_cast<char>(ch));
+    }
+  }
+  return safe.empty() ? std::string("upload.bin") : safe;
 }
 
 // Current epoch seconds (Cloudinary `timestamp`).
@@ -148,7 +189,7 @@ UploadResult MediaService::upload(const std::string& bytes,
   //    raw (possibly binary) file bytes survive verbatim, and so the field
   //    ordering / boundary are fully under our control. Cloudinary accepts the
   //    signed params as ordinary multipart text fields. ──
-  const std::string fname = filename.empty() ? std::string("upload.bin") : filename;
+  const std::string fname = sanitizeMultipartFilename(filename);
 
   std::vector<std::pair<std::string, std::string>> formFields;
   formFields.emplace_back("api_key", apiKey_);
@@ -159,7 +200,7 @@ UploadResult MediaService::upload(const std::string& bytes,
   if (!eager.empty())            formFields.emplace_back("eager", eager);
   if (opts.eagerAsync)           formFields.emplace_back("eager_async", "true");
 
-  const std::string boundary = "----PulseCloudinaryBoundary";
+  const std::string boundary = randomMultipartBoundary();
   std::ostringstream body;
   for (const auto& [k, v] : formFields) {
     body << "--" << boundary << "\r\n";
@@ -188,7 +229,7 @@ UploadResult MediaService::upload(const std::string& bytes,
       req,
       [&prom](drogon::ReqResult r, const drogon::HttpResponsePtr& resp) {
         prom.set_value({r, resp});
-      });
+      }, pulse::services::outboundHttpTimeoutSeconds());
   auto [reqResult, resp] = fut.get();
 
   if (reqResult != drogon::ReqResult::Ok || !resp) {
@@ -208,7 +249,8 @@ UploadResult MediaService::upload(const std::string& bytes,
     std::string msg = resBody["error"].isMember("message")
                           ? resBody["error"]["message"].asString()
                           : "Upload failed";
-    pulse::log::error("Cloudinary upload error: {}", msg);
+    pulse::log::error("Cloudinary upload rejected (status {})",
+                      static_cast<int>(resp->getStatusCode()));
     throw std::runtime_error(msg);
   }
 
@@ -296,7 +338,7 @@ Json::Value MediaService::destroy(const std::string& publicId,
   signList.emplace_back("timestamp", timestamp);
   const std::string signature = signParams(signList);
 
-  const std::string boundary = "----PulseCloudinaryBoundary";
+  const std::string boundary = randomMultipartBoundary();
   std::vector<std::pair<std::string, std::string>> formFields = {
       {"public_id", publicId},
       {"timestamp", timestamp},
@@ -322,11 +364,11 @@ Json::Value MediaService::destroy(const std::string& publicId,
   auto fut = prom.get_future();
   client->sendRequest(req, [&prom](drogon::ReqResult r, const drogon::HttpResponsePtr& resp) {
     prom.set_value({r, resp});
-  });
+  }, pulse::services::outboundHttpTimeoutSeconds());
   auto [reqResult, resp] = fut.get();
 
   if (reqResult != drogon::ReqResult::Ok || !resp) {
-    pulse::log::error("Cloudinary destroy transport error for {}", publicId);
+    pulse::log::error("Cloudinary destroy transport error");
     out["result"] = "error";
     return out;
   }
