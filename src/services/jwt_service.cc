@@ -8,8 +8,10 @@
 // backed by Json::Value.
 #include <jwt-cpp/traits/open-source-parsers-jsoncpp/defaults.h>
 #include <json/json.h>
-#include <random>
+#include <openssl/rand.h>
 #include <chrono>
+#include <stdexcept>
+#include <vector>
 
 namespace pulse {
 
@@ -20,26 +22,43 @@ constexpr const char* kAudience = "pulse-users";
 // Parse a JS-style duration ("15m", "7d", "10m", "900s") to seconds.
 std::chrono::seconds parseDuration(const std::string& s, long long fallbackSec) {
   if (s.empty()) return std::chrono::seconds(fallbackSec);
-  char unit = s.back();
-  long long n = 0;
-  try { n = std::stoll(s.substr(0, s.size() - 1)); } catch (...) { return std::chrono::seconds(fallbackSec); }
-  switch (unit) {
-    case 's': return std::chrono::seconds(n);
-    case 'm': return std::chrono::seconds(n * 60);
-    case 'h': return std::chrono::seconds(n * 3600);
-    case 'd': return std::chrono::seconds(n * 86400);
-    default:
-      try { return std::chrono::seconds(std::stoll(s)); } catch (...) { return std::chrono::seconds(fallbackSec); }
+  constexpr long long kMaxSeconds = 10LL * 365 * 24 * 60 * 60;
+  long long multiplier = 1;
+  std::string number = s;
+  switch (s.back()) {
+    case 's': multiplier = 1; number.pop_back(); break;
+    case 'm': multiplier = 60; number.pop_back(); break;
+    case 'h': multiplier = 60 * 60; number.pop_back(); break;
+    case 'd': multiplier = 24 * 60 * 60; number.pop_back(); break;
+    default: break;
+  }
+
+  try {
+    std::size_t consumed = 0;
+    const long long value = std::stoll(number, &consumed);
+    if (consumed != number.size() || value <= 0 ||
+        value > kMaxSeconds / multiplier) {
+      return std::chrono::seconds(fallbackSec);
+    }
+    return std::chrono::seconds(value * multiplier);
+  } catch (...) {
+    return std::chrono::seconds(fallbackSec);
   }
 }
 
 std::string randomHex(size_t bytes) {
-  static thread_local std::mt19937_64 rng{std::random_device{}()};
-  std::uniform_int_distribution<int> d(0, 15);
+  std::vector<unsigned char> random(bytes);
+  if (bytes > 0 &&
+      RAND_bytes(random.data(), static_cast<int>(random.size())) != 1) {
+    throw JwtError("Secure random generation failed");
+  }
   static const char* hex = "0123456789abcdef";
   std::string out;
   out.reserve(bytes * 2);
-  for (size_t i = 0; i < bytes * 2; ++i) out += hex[d(rng)];
+  for (unsigned char value : random) {
+    out.push_back(hex[(value >> 4) & 0x0f]);
+    out.push_back(hex[value & 0x0f]);
+  }
   return out;
 }
 } // namespace
@@ -58,13 +77,21 @@ JwtService::JwtService() {
 
 JwtService& JwtService::instance() { static JwtService s; return s; }
 
+int JwtService::accessTokenTtlSeconds() const {
+  return static_cast<int>(parseDuration(accessTtl_, 900).count());
+}
+
+int JwtService::refreshTokenTtlSeconds() const {
+  return static_cast<int>(parseDuration(refreshTtl_, 604800).count());
+}
+
 std::string JwtService::generateAccessToken(const AccessClaims& c) {
   auto now = std::chrono::system_clock::now();
   return jwt::create()
       .set_issuer(kIssuer)
       .set_audience(kAudience)
       .set_issued_at(now)
-      .set_expires_at(now + parseDuration(accessTtl_, 900))
+      .set_expires_at(now + std::chrono::seconds(accessTokenTtlSeconds()))
       .set_payload_claim("userId", jwt::claim(c.userId))
       .set_payload_claim("username", jwt::claim(c.username))
       .set_payload_claim("email", jwt::claim(c.email))
@@ -81,7 +108,7 @@ std::string JwtService::generateRefreshToken(const RefreshClaims& cIn) {
       .set_issuer(kIssuer)
       .set_audience(kAudience)
       .set_issued_at(now)
-      .set_expires_at(now + parseDuration(refreshTtl_, 604800))
+      .set_expires_at(now + std::chrono::seconds(refreshTokenTtlSeconds()))
       .set_payload_claim("userId", jwt::claim(c.userId))
       .set_payload_claim("deviceId", jwt::claim(c.deviceId))
       .set_payload_claim("type", jwt::claim(std::string("refresh")))
@@ -175,8 +202,7 @@ TokenPair JwtService::generateTokenPair(const std::string& userId, const std::st
 
 std::string JwtService::extractUserId(const std::string& token) {
   try {
-    auto d = jwt::decode(token);
-    if (d.has_payload_claim("userId")) return d.get_payload_claim("userId").as_string();
+    return verifyAccessToken(token).userId;
   } catch (...) {}
   return "";
 }

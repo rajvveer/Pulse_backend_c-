@@ -55,6 +55,11 @@ public:
   std::string extractUserId(const std::string& token);
   bool isTokenExpired(const std::string& token);
 
+  // Configured lifetimes in seconds. Callers use these for response metadata
+  // and revocation TTLs so a JWT_EXPIRES_IN change cannot leave a denylist gap.
+  int accessTokenTtlSeconds() const;
+  int refreshTokenTtlSeconds() const;
+
 private:
   JwtService();
   std::string accessSecret_, refreshSecret_, tempSecret_;
