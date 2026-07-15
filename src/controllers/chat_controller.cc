@@ -403,12 +403,22 @@ void ChatController::getMessages(
     const std::string limitParam = req->getParameter("limit");  // default 50
     const std::string before = req->getParameter("before");
 
+    auto conversationOid = pulse::bsonjson::tryOid(conversationId);
+    if (!conversationOid) {
+      callback(failMessage(drogon::k400BadRequest, "Invalid conversation"));
+      return;
+    }
+    auto userOid = pulse::bsonjson::tryOid(userId);
+    if (!userOid) {
+      callback(failMessage(drogon::k403Forbidden, "Not authorized"));
+      return;
+    }
+
     auto convCol = pulse::db::collection(pulse::models::conversation::kCollection);
 
     // Security: findOne({ _id: conversationId, participants: userId })
     auto conversation = convCol.find_one(make_document(
-        kvp("_id", pulse::bsonjson::oid(conversationId)),
-        kvp("participants", pulse::bsonjson::oid(userId))));
+        kvp("_id", *conversationOid), kvp("participants", *userOid)));
 
     if (!conversation) {
       callback(failMessage(drogon::k403Forbidden, "Not authorized"));
@@ -417,7 +427,7 @@ void ChatController::getMessages(
 
     // query = { conversation: conversationId, isDeleted: { $ne: true } }
     bld::document query;
-    query.append(kvp("conversation", pulse::bsonjson::oid(conversationId)));
+    query.append(kvp("conversation", *conversationOid));
     query.append(kvp("isDeleted", make_document(kvp("$ne", true))));
     // if (before) query.createdAt = { $lt: new Date(before) }
     if (!before.empty()) {
@@ -429,8 +439,7 @@ void ChatController::getMessages(
     long long limit = 50;
     if (!limitParam.empty()) {
       auto p = jsParseInt(limitParam);
-      if (p) limit = *p;  // NaN -> Mongoose treats as no limit; JS passes NaN to
-                          // .limit which Mongo ignores. We keep parsed value.
+      if (p) limit = std::max(1LL, std::min(100LL, *p));
     }
 
     auto msgCol = pulse::db::collection(pulse::models::message::kCollection);
@@ -460,16 +469,21 @@ void ChatController::getMessages(
           mongocxx::options::find rOpts;
           rOpts.projection(make_document(kvp("content", 1), kvp("sender", 1),
                                          kvp("type", 1), kvp("media", 1)));
-          auto reply = msgCol.find_one(make_document(kvp("_id", *replyOid)),
-                                       rOpts);
+          auto reply = msgCol.find_one(make_document(
+              kvp("_id", *replyOid), kvp("conversation", *conversationOid),
+              kvp("isDeleted", make_document(kvp("$ne", true)))), rOpts);
           if (reply) {
             Json::Value replyJson = pulse::models::message::sanitizeForOutput(
                 pulse::bsonjson::toJson(reply->view()));
             populateUserField(replyJson, "sender", replySenderProj);
             msg["replyTo"] = replyJson;
+          } else {
+            // Do not expose a reply from another conversation (or a deleted
+            // message) merely because its ObjectId was stored here.
+            msg["replyTo"] = Json::Value(Json::nullValue);
           }
-          // if reply missing, leave the id in place (Mongoose: replyTo -> null,
-          // but our ref stays as id; harmless for the client).
+        } else {
+          msg["replyTo"] = Json::Value(Json::nullValue);
         }
       }
 

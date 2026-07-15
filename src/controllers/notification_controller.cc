@@ -15,6 +15,7 @@
 // pulse::http::json directly.
 #include "pulse/controllers/notification_controller.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <exception>
 #include <optional>
@@ -41,22 +42,28 @@ namespace {
 // Mirrors `parseInt(str, 10)`: trims leading whitespace, reads an optional sign
 // then digits, stops at the first non-digit, returns nullopt (NaN) when no digit
 // was consumed.
-std::optional<long> jsParseInt(const std::string& s) {
+std::optional<long long> jsParseInt(const std::string& s) {
   size_t i = 0;
   while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
-  bool neg = false;
+  const size_t start = i;
   if (i < s.size() && (s[i] == '+' || s[i] == '-')) {
-    neg = (s[i] == '-');
     ++i;
   }
-  size_t start = i;
-  long value = 0;
-  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) {
-    value = value * 10 + (s[i] - '0');
-    ++i;
+  const size_t digitsStart = i;
+  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+  if (i == digitsStart) return std::nullopt;
+  try {
+    return std::stoll(s.substr(start, i - start));
+  } catch (...) {
+    return std::nullopt;
   }
-  if (i == start) return std::nullopt;  // no digits -> NaN
-  return neg ? -value : value;
+}
+
+int clampedParam(const std::string& raw, int fallback, int lo, int hi) {
+  auto parsed = jsParseInt(raw);
+  long long value = (!parsed || *parsed == 0) ? fallback : *parsed;
+  value = std::max<long long>(lo, std::min<long long>(hi, value));
+  return static_cast<int>(value);
 }
 
 // req.user.userId from the AuthFilter-populated attribute.
@@ -101,14 +108,8 @@ void NotificationController::getNotifications(
     // Destructured defaults (page=1, limit=20) apply only when the query key is
     // absent; when present the value is parseInt'd. Drogon returns "" for an
     // absent param, matching JS `undefined` -> use the destructured default.
-    const std::string pageRaw = req->getParameter("page");
-    options.page = pageRaw.empty()
-                       ? 1
-                       : static_cast<int>(jsParseInt(pageRaw).value_or(1));
-    const std::string limitRaw = req->getParameter("limit");
-    options.limit = limitRaw.empty()
-                        ? 20
-                        : static_cast<int>(jsParseInt(limitRaw).value_or(20));
+    options.page = clampedParam(req->getParameter("page"), 1, 1, 10000);
+    options.limit = clampedParam(req->getParameter("limit"), 20, 1, 100);
 
     // type: type || null — empty/absent query string is falsy -> no type filter.
     const std::string type = req->getParameter("type");
@@ -186,6 +187,11 @@ void NotificationController::markAsRead(
   try {
     const std::string userId = authedUserId(req);
 
+    if (!pulse::bsonjson::tryOid(id) || !pulse::bsonjson::tryOid(userId)) {
+      callback(notFoundMsg("Notification not found"));
+      return;
+    }
+
     std::optional<Json::Value> notification = model::markAsRead(id, userId);
     if (!notification) {
       callback(notFoundMsg("Notification not found"));
@@ -212,17 +218,20 @@ void NotificationController::deleteNotification(
   try {
     const std::string userId = authedUserId(req);
 
+    auto notificationId = pulse::bsonjson::tryOid(id);
+    auto recipientId = pulse::bsonjson::tryOid(userId);
+    if (!notificationId || !recipientId) {
+      callback(notFoundMsg("Notification not found"));
+      return;
+    }
+
     // findOneAndDelete({ _id: id, recipient: userId }). _id and recipient are
     // ObjectIds in the schema; coerce 24-hex strings to ObjectId (string
     // fallback mirrors the model statics so a non-oid simply matches nothing).
-    bld::document filter;
-    if (auto nid = pulse::bsonjson::tryOid(id)) filter.append(kvp("_id", *nid));
-    else                                        filter.append(kvp("_id", id));
-    if (auto rid = pulse::bsonjson::tryOid(userId)) filter.append(kvp("recipient", *rid));
-    else                                            filter.append(kvp("recipient", userId));
-
     auto result =
-        pulse::db::collection(model::kCollection).find_one_and_delete(filter.view());
+        pulse::db::collection(model::kCollection).find_one_and_delete(
+            make_document(kvp("_id", *notificationId),
+                          kvp("recipient", *recipientId)));
 
     if (!result) {
       callback(notFoundMsg("Notification not found"));
